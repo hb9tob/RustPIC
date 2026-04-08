@@ -113,6 +113,15 @@ pub const RS_K:  usize = 191;
 pub const RS_2T: usize = 64;
 pub const RS_T:  usize = 32;
 
+/// Statistics returned by a successful RS decode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RsDecodeStats {
+    /// Number of random errors corrected (not counting erasures).
+    pub errors_corrected: usize,
+    /// Number of erasure positions consumed.
+    pub erasures_used: usize,
+}
+
 /// RS(255, 191) codec.
 pub struct RsCodec {
     gf:  Gf256,
@@ -178,8 +187,10 @@ impl RsCodec {
     /// * `received`  — 255 bytes.
     /// * `erasures`  — byte positions (0…254) that are known to be erased.
     ///
-    /// Returns 191 decoded information bytes, or an [`RsError`].
-    pub fn decode(&self, received: &[u8], erasures: &[usize]) -> Result<Vec<u8>, RsError> {
+    /// Returns 191 decoded information bytes plus correction statistics, or an [`RsError`].
+    pub fn decode(&self, received: &[u8], erasures: &[usize])
+        -> Result<(Vec<u8>, RsDecodeStats), RsError>
+    {
         assert_eq!(received.len(), RS_N);
         let f = erasures.len();
         if f > RS_2T {
@@ -191,7 +202,8 @@ impl RsCodec {
         // ── Syndromes ─────────────────────────────────────────────────────────
         let synd = self.syndromes(received);
         if synd.iter().all(|&s| s == 0) && f == 0 {
-            return Ok(received[RS_2T..].to_vec());
+            return Ok((received[RS_2T..].to_vec(),
+                       RsDecodeStats { errors_corrected: 0, erasures_used: 0 }));
         }
 
         // ── Erasure locator Γ(x) = Π (1 − α^ρᵢ · x) ─────────────────────────
@@ -210,7 +222,7 @@ impl RsCodec {
         // ── BM on the part of T beyond the erasure locator ────────────────────
         let sigma = berlekamp_massey(gf, &t_poly[f.min(RS_2T)..]);
 
-        let n_err = sigma.len().saturating_sub(1);
+        let n_err = sigma.len().saturating_sub(1); // random errors (excl. erasures)
         if 2 * n_err + f > RS_2T {
             return Err(RsError::TooManyErrors { errors: n_err, erasures: f });
         }
@@ -252,7 +264,8 @@ impl RsCodec {
             return Err(RsError::DecodingFailed("syndromes non-zero after correction"));
         }
 
-        Ok(corrected[RS_2T..].to_vec())
+        Ok((corrected[RS_2T..].to_vec(),
+            RsDecodeStats { errors_corrected: n_err, erasures_used: f }))
     }
 }
 
@@ -401,8 +414,10 @@ mod tests {
         let rs   = RsCodec::new();
         let data: Vec<u8> = (0..RS_K as u8).collect();
         let cw   = rs.encode(&data);
-        let dec  = rs.decode(&cw, &[]).expect("no-error decode");
+        let (dec, stats) = rs.decode(&cw, &[]).expect("no-error decode");
         assert_eq!(dec, data);
+        assert_eq!(stats.errors_corrected, 0);
+        assert_eq!(stats.erasures_used, 0);
     }
 
     #[test]
@@ -411,8 +426,9 @@ mod tests {
         let data: Vec<u8> = (0..RS_K as u8).collect();
         let mut cw = rs.encode(&data);
         cw[5] ^= 0xFF; // error at parity position 5
-        let dec = rs.decode(&cw, &[]).expect("single error");
+        let (dec, stats) = rs.decode(&cw, &[]).expect("single error");
         assert_eq!(dec, data);
+        assert_eq!(stats.errors_corrected, 1);
     }
 
     #[test]
@@ -422,8 +438,9 @@ mod tests {
         let mut cw = rs.encode(&data);
         // 32 errors at even parity positions 0,2,4,...,62
         for i in 0..RS_T { cw[i * 2] ^= 0xA5; }
-        let dec = rs.decode(&cw, &[]).expect("t=32 errors");
+        let (dec, stats) = rs.decode(&cw, &[]).expect("t=32 errors");
         assert_eq!(dec, data);
+        assert_eq!(stats.errors_corrected, RS_T);
     }
 
     #[test]
@@ -435,8 +452,10 @@ mod tests {
         let erase: Vec<usize> = (0..RS_2T).collect();
         let mut rx = cw.clone();
         for &p in &erase { rx[p] = 0; }
-        let dec = rs.decode(&rx, &erase).expect("64 erasures (all parity)");
+        let (dec, stats) = rs.decode(&rx, &erase).expect("64 erasures (all parity)");
         assert_eq!(dec, data);
+        assert_eq!(stats.errors_corrected, 0);
+        assert_eq!(stats.erasures_used, RS_2T);
     }
 
     #[test]
@@ -449,8 +468,10 @@ mod tests {
         let erase: Vec<usize> = (20..60).collect();
         for &p in &erase { cw[p] = 0; }
         for i in 0..10usize { cw[i] ^= 0x1F; } // errors at 0..9 (disjoint from erasures)
-        let dec = rs.decode(&cw, &erase).expect("10 errors + 40 erasures");
+        let (dec, stats) = rs.decode(&cw, &erase).expect("10 errors + 40 erasures");
         assert_eq!(dec, data);
+        assert_eq!(stats.errors_corrected, 10);
+        assert_eq!(stats.erasures_used, 40);
     }
 
     #[test]

@@ -176,8 +176,27 @@ impl ZcCorrelator {
         }
 
         // ── Stage 2: confirmation — second ZC at best_pos + SYMBOL_LEN ───────
-        let zc2_start = best_pos + SYMBOL_LEN;
-        let confirm_metric = self.single_metric(&samples[zc2_start..zc2_start + SYMBOL_LEN]);
+        let mut zc2_start      = best_pos + SYMBOL_LEN;
+        let mut confirm_metric = self.single_metric(&samples[zc2_start..zc2_start + SYMBOL_LEN]);
+        let mut best_pos       = best_pos;
+        let mut best_metric    = best_metric;
+
+        // With two identical preamble ZC symbols, the global peak can land on
+        // ZC#2 instead of ZC#1 (they have equal SNR).  If confirmation fails,
+        // check whether `best_pos − SYMBOL_LEN` is ZC#1 (with ZC#2 as its
+        // confirmation).
+        if confirm_metric < self.confirm_threshold && best_pos >= SYMBOL_LEN {
+            let alt_pos    = best_pos - SYMBOL_LEN;
+            let alt_metric = self.single_metric(&samples[alt_pos..alt_pos + SYMBOL_LEN]);
+            // The original best_pos IS ZC#2 → its correlation is the confirmation metric
+            let alt_confirm = best_metric;
+            if alt_metric >= self.threshold && alt_confirm >= self.confirm_threshold {
+                best_pos       = alt_pos;
+                best_metric    = alt_metric;
+                zc2_start      = best_pos + SYMBOL_LEN;
+                confirm_metric = alt_confirm;
+            }
+        }
 
         if confirm_metric < self.confirm_threshold {
             return Err(SyncError::ConfirmationFailed {

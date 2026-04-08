@@ -18,6 +18,7 @@ rustfft     = "6.2"
 num-complex = "0.4"
 thiserror   = "2"
 tracing     = "0.1"
+rand        = "0.8"
 
 [dev-dependencies]
 approx = "0.5"

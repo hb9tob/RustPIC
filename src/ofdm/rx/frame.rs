@@ -57,7 +57,7 @@
 use num_complex::Complex32;
 
 use crate::fec::ldpc::{LdpcCode, LdpcDecoder};
-use crate::fec::rs::{RsCodec, RS_K, RS_N};
+use crate::fec::rs::{RsCodec, RS_2T, RS_K, RS_N};
 use crate::ofdm::params::*;
 use crate::ofdm::rx::{
     demapper::demap,
@@ -95,6 +95,32 @@ pub enum PushResult {
     Error(FrameError),
 }
 
+/// Per-frame channel and codec statistics.
+#[derive(Debug, Clone)]
+pub struct FrameMetrics {
+    /// Estimated channel BER: fraction of bits flipped by the channel
+    /// (measured as hard-decision errors corrected by LDPC / total coded bits).
+    pub channel_ber: f32,
+
+    /// Number of LDPC blocks that converged (all parity checks satisfied).
+    pub ldpc_converged: u32,
+
+    /// Total LDPC blocks decoded in this frame.
+    pub ldpc_total: u32,
+
+    /// Total RS byte errors corrected across all RS packets.
+    pub rs_errors_corrected: u32,
+
+    /// Total RS erasures consumed (from failed LDPC blocks) across all RS packets.
+    pub rs_erasures_used: u32,
+
+    /// Minimum RS correction budget remaining as a fraction of `RS_2T = 64`,
+    /// taken over all successfully decoded RS packets.
+    /// Value 1.0 means no budget was used; 0.0 means budget was exactly exhausted.
+    /// Stays at 1.0 if no RS packet succeeded.
+    pub rs_margin_frac: f32,
+}
+
 /// Decoded super-frame payload.
 #[derive(Debug, Clone)]
 pub struct FrameResult {
@@ -111,6 +137,9 @@ pub struct FrameResult {
 
     /// Average pilot SNR over all received data symbols (dB).
     pub pilot_snr_db: f32,
+
+    /// Channel and codec statistics for this frame.
+    pub metrics: FrameMetrics,
 }
 
 /// Error returned when the frame cannot be completed.
@@ -180,6 +209,16 @@ pub struct FrameReceiver {
     // ── SNR bookkeeping ────────────────────────────────────────────────────────
     pilot_snr_sum:   f32,
     pilot_snr_count: usize,
+
+    // ── Metrics accumulation ───────────────────────────────────────────────────
+    /// Convergence flag for each decoded LDPC block (across all RS packets).
+    ldpc_block_converged: Vec<bool>,
+    channel_bit_errors:   u32,
+    channel_bit_total:    u32,
+    rs_errors_corrected:  u32,
+    rs_erasures_used:     u32,
+    /// Running minimum of (RS_2T − 2·errors − erasures) / RS_2T.
+    rs_min_margin_frac:   f32,
 }
 
 impl FrameReceiver {
@@ -216,6 +255,12 @@ impl FrameReceiver {
             rs_packets_ok:       0,
             pilot_snr_sum:       0.0,
             pilot_snr_count:     0,
+            ldpc_block_converged: Vec::new(),
+            channel_bit_errors:   0,
+            channel_bit_total:    0,
+            rs_errors_corrected:  0,
+            rs_erasures_used:     0,
+            rs_min_margin_frac:   1.0,
         }
     }
 
@@ -279,11 +324,27 @@ impl FrameReceiver {
             // Consume exactly LDPC_N LLRs
             let block_llrs: Vec<f32> = self.llr_buf.drain(..LDPC_N).collect();
 
+            // Hard-decision bits before LDPC (for BER estimation)
+            let hard_bits: Vec<u8> = block_llrs.iter()
+                .map(|&l| u8::from(l < 0.0))
+                .collect();
+
             // Decode LDPC — decoder borrows &self.code in its own scope
-            let decoded_bits: Vec<u8> = {
+            let decode_result = {
                 let decoder = LdpcDecoder::new(&self.code, 50, 0.75);
-                decoder.decode(&block_llrs).bits
+                decoder.decode(&block_llrs)
             };
+            let decoded_bits = decode_result.bits;
+
+            // Accumulate channel BER (bits the decoder had to flip)
+            let bit_errors: u32 = hard_bits.iter().zip(decoded_bits.iter())
+                .filter(|(&h, &d)| h != d)
+                .count() as u32;
+            self.channel_bit_errors += bit_errors;
+            self.channel_bit_total  += LDPC_N as u32;
+
+            // Track convergence
+            self.ldpc_block_converged.push(decode_result.converged);
 
             // Extract info bits from the positions identified during code construction
             for &col in &self.code.info_cols {
@@ -321,11 +382,36 @@ impl FrameReceiver {
             }
         }
 
-        // RS decode (no erasures — we decode optimistically; RS handles errors)
-        match self.rs.decode(&codeword, &[]) {
-            Ok(info_bytes) => {
+        // Compute RS erasure byte positions from LDPC blocks that did not converge
+        let blk_end   = self.ldpc_blocks_decoded;
+        let blk_start = blk_end - self.blocks_per_rs;
+        let mut erasure_set = std::collections::BTreeSet::new();
+        for (offset, &converged) in self.ldpc_block_converged[blk_start..blk_end].iter().enumerate() {
+            if !converged {
+                let bit_start  = offset * self.ldpc_k;
+                let bit_end    = ((offset + 1) * self.ldpc_k).min(RS_CODEWORD_BITS);
+                let byte_start = bit_start / 8;
+                let byte_end   = (bit_end + 7) / 8;
+                for pos in byte_start..byte_end.min(RS_N) {
+                    erasure_set.insert(pos);
+                }
+            }
+        }
+        let erasures: Vec<usize> = erasure_set.into_iter().collect();
+
+        // RS decode with erasures from failed LDPC blocks
+        match self.rs.decode(&codeword, &erasures) {
+            Ok((info_bytes, stats)) => {
                 self.rs_payload.extend_from_slice(&info_bytes);
-                self.rs_packets_ok += 1;
+                self.rs_packets_ok      += 1;
+                self.rs_errors_corrected += stats.errors_corrected as u32;
+                self.rs_erasures_used    += stats.erasures_used as u32;
+                // RS budget remaining: (RS_2T − 2·errors − erasures) / RS_2T
+                let budget_used = 2 * stats.errors_corrected + stats.erasures_used;
+                let margin = 1.0 - budget_used as f32 / RS_2T as f32;
+                if margin < self.rs_min_margin_frac {
+                    self.rs_min_margin_frac = margin;
+                }
             }
             Err(_) => {
                 // RS failed: zero-fill so the payload slice remains aligned
@@ -373,11 +459,25 @@ impl FrameReceiver {
             0.0
         };
 
+        let metrics = FrameMetrics {
+            channel_ber: if self.channel_bit_total > 0 {
+                self.channel_bit_errors as f32 / self.channel_bit_total as f32
+            } else {
+                0.0
+            },
+            ldpc_converged:      self.ldpc_block_converged.iter().filter(|&&c| c).count() as u32,
+            ldpc_total:          self.ldpc_block_converged.len() as u32,
+            rs_errors_corrected: self.rs_errors_corrected,
+            rs_erasures_used:    self.rs_erasures_used,
+            rs_margin_frac:      self.rs_min_margin_frac,
+        };
+
         PushResult::FrameComplete(FrameResult {
             payload:    std::mem::take(&mut self.rs_payload),
             packets_ok: self.rs_packets_ok,
             crc32_ok,
             pilot_snr_db,
+            metrics,
         })
     }
 }
