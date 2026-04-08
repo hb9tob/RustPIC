@@ -130,7 +130,7 @@ fn max_log_llr(
 // ── Constellation builders ────────────────────────────────────────────────────
 
 /// Returns the constellation points for `modulation` as `(symbol, gray_code)`.
-fn constellation_points(m: Modulation) -> Vec<(Complex32, u32)> {
+pub(crate) fn constellation_points(m: Modulation) -> Vec<(Complex32, u32)> {
     match m {
         Modulation::Bpsk  => bpsk_points(),
         Modulation::Qpsk  => qpsk_points(),

@@ -52,7 +52,7 @@ pub struct LdpcCode {
     pub n: usize,
     /// Number of parity checks (rows of H).
     pub m: usize,
-    /// Number of information bits  k = n − rank(H)  (≥ n − m).
+    /// Number of information bits  k = n − rank(H).
     pub k: usize,
     /// `check_to_var[c]` = list of variable indices in check c's neighbourhood.
     pub check_to_var: Vec<Vec<usize>>,
@@ -62,25 +62,32 @@ pub struct LdpcCode {
     /// c = `var_to_check[v][j]`.  Pre-computed to avoid linear search in the
     /// inner decoder loop.
     var_pos_in_check: Vec<Vec<usize>>,
+
+    // ── Systematic form (pre-computed once in new()) ──────────────────────────
+    /// Codeword column indices that carry the **information bits**.
+    /// Length = k.  Extracted from the BP-decoded codeword by the RX.
+    pub info_cols: Vec<usize>,
+    /// Codeword column indices for the **parity bits** (RREF pivot columns).
+    /// Length = m.
+    pub parity_cols: Vec<usize>,
+    /// Generator sub-matrix: `parity[i] = XOR of info[j]` for every j where
+    /// `parity_gen[i][j] = 1`.  Dimensions m × k (one `u8` per bit for clarity).
+    parity_gen: Vec<Vec<u8>>,
 }
 
 impl LdpcCode {
     /// Constructs an `LdpcCode` from a list of check-node adjacency lists.
     ///
-    /// `check_to_var` must list variable indices 0 … n−1.
-    /// `k` is the number of information bits.
+    /// Internally performs Gauss–Jordan elimination over GF(2) to compute the
+    /// systematic form (info/parity column split + parity generation matrix).
     pub fn new(n: usize, k: usize, check_to_var: Vec<Vec<usize>>) -> Self {
         let m = check_to_var.len();
 
-        // Build var_to_check from check_to_var
+        // ── Decoder adjacency structures ──────────────────────────────────────
         let mut var_to_check: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (c, vars) in check_to_var.iter().enumerate() {
-            for &v in vars {
-                var_to_check[v].push(c);
-            }
+            for &v in vars { var_to_check[v].push(c); }
         }
-
-        // Pre-compute position of v inside check c's list
         let mut var_pos_in_check: Vec<Vec<usize>> = vec![Vec::new(); n];
         for v in 0..n {
             for &c in &var_to_check[v] {
@@ -89,7 +96,17 @@ impl LdpcCode {
             }
         }
 
-        Self { n, m, k, check_to_var, var_to_check, var_pos_in_check }
+        // ── Systematic form via RREF of H ─────────────────────────────────────
+        let (info_cols, parity_cols, parity_gen) =
+            compute_systematic_form(&check_to_var, n, m);
+        debug_assert_eq!(info_cols.len(),   k, "H rank ≠ m; expected k={k}");
+        debug_assert_eq!(parity_cols.len(), m);
+
+        Self {
+            n, m, k,
+            check_to_var, var_to_check, var_pos_in_check,
+            info_cols, parity_cols, parity_gen,
+        }
     }
 
     /// Returns a pre-built code for the given LDPC rate.
@@ -115,6 +132,99 @@ impl LdpcCode {
             nbrs.iter().map(|&v| bits[v]).fold(0u8, |a, b| a ^ b) == 0
         })
     }
+
+    /// Systematic encoder: given `k` info bits, returns an `n`-bit codeword.
+    ///
+    /// Info bits are placed at the positions given by `self.info_cols`;
+    /// parity bits are computed at `self.parity_cols` using the pre-computed
+    /// generator matrix `parity_gen`:
+    ///
+    /// ```text
+    /// codeword[parity_cols[i]] = XOR of info_bits[j]
+    ///                            for j in 0..k where parity_gen[i][j] = 1
+    /// ```
+    ///
+    /// The RX reconstructs the info bits by extracting `decoded_bits[info_cols]`.
+    pub fn encode(&self, info_bits: &[u8]) -> Vec<u8> {
+        assert_eq!(info_bits.len(), self.k);
+
+        let mut codeword = vec![0u8; self.n];
+
+        // Place info bits at their codeword positions
+        for (j, &col) in self.info_cols.iter().enumerate() {
+            codeword[col] = info_bits[j];
+        }
+
+        // Compute each parity bit: p_i = parity_gen[i] · info (mod 2)
+        for (i, &pcol) in self.parity_cols.iter().enumerate() {
+            let p: u8 = self.parity_gen[i].iter()
+                .zip(info_bits.iter())
+                .map(|(&g, &b)| g & b)
+                .fold(0u8, |a, x| a ^ x);
+            codeword[pcol] = p;
+        }
+
+        codeword
+    }
+}
+
+// ── Systematic form computation ───────────────────────────────────────────────
+
+/// Computes the systematic form of H via Gauss–Jordan elimination over GF(2).
+///
+/// Returns `(info_cols, parity_cols, parity_gen)`:
+/// * `info_cols`  — non-pivot column indices (length k = n − rank).
+/// * `parity_cols`— pivot column indices (length m = rank(H)).
+/// * `parity_gen` — m × k binary matrix: `parity[i] = parity_gen[i] · info`.
+fn compute_systematic_form(
+    check_to_var: &[Vec<usize>],
+    n: usize,
+    m: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<Vec<u8>>) {
+    // Build H as m rows of n bits (u8 per bit for simplicity at n=252)
+    let mut h: Vec<Vec<u8>> = vec![vec![0u8; n]; m];
+    for (c, vars) in check_to_var.iter().enumerate() {
+        for &v in vars { h[c][v] = 1; }
+    }
+
+    // ── Gauss–Jordan elimination ──────────────────────────────────────────────
+    let mut pivot_row = 0usize;
+    let mut parity_cols: Vec<usize> = Vec::with_capacity(m);
+
+    'col: for col in 0..n {
+        // Find a row >= pivot_row with a 1 in this column
+        for r in pivot_row..m {
+            if h[r][col] == 1 {
+                h.swap(pivot_row, r);
+                parity_cols.push(col);
+
+                // Eliminate this column from every other row (full RREF)
+                for r2 in 0..m {
+                    if r2 != pivot_row && h[r2][col] == 1 {
+                        let prow = h[pivot_row].clone();
+                        for c2 in 0..n { h[r2][c2] ^= prow[c2]; }
+                    }
+                }
+                pivot_row += 1;
+                if pivot_row == m { break 'col; }
+                continue 'col;
+            }
+        }
+    }
+
+    // ── Info and parity column sets ───────────────────────────────────────────
+    let parity_set: std::collections::HashSet<usize> =
+        parity_cols.iter().copied().collect();
+    let info_cols: Vec<usize> = (0..n).filter(|c| !parity_set.contains(c)).collect();
+
+    // ── Parity generation matrix from RREF ───────────────────────────────────
+    // After RREF, row i has pivot in parity_cols[i].  The remaining non-zero
+    // entries in row i are exactly the info columns contributing to parity_cols[i].
+    let parity_gen: Vec<Vec<u8>> = (0..pivot_row)
+        .map(|i| info_cols.iter().map(|&c| h[i][c]).collect())
+        .collect();
+
+    (info_cols, parity_cols, parity_gen)
 }
 
 // ── LdpcDecoder ───────────────────────────────────────────────────────────────
@@ -298,11 +408,17 @@ const PROTO_R34: &[(usize, usize, i32)] = &[
 ];
 
 /// Rate 5/6 protograph: m_b=2, n_b=12, code (252, 210).
+///
+/// The parity columns (vg10, vg11) are lower-triangular to guarantee a
+/// full-rank H.  The info side (vg0..9) uses distinct shifts in each check
+/// group to avoid GF(2) cancellations that would reduce the matrix rank.
 const PROTO_R56: &[(usize, usize, i32)] = &[
-    (0,0,0),(0,1,4),(0,2,9),(0,3,14),(0,4,2),(0,5,7),
-    (0,6,12),(0,7,1),(0,8,6),(0,9,11),(0,10,3),(0,11,8),
-    (1,0,5),(1,1,10),(1,2,15),(1,3,3),(1,4,8),(1,5,13),
-    (1,6,0),(1,7,5),(1,8,10),(1,9,2),(1,10,7),(1,11,0),
+    // info connections (var_groups 0..9)
+    (0,0,0),(0,1,4),(0,2,9),(0,3,14),(0,4,2),(0,5,7),(0,6,12),(0,7,1),(0,8,6),(0,9,11),
+    (1,0,5),(1,1,10),(1,2,15),(1,3,3),(1,4,8),(1,5,13),(1,6,1),(1,7,6),(1,8,11),(1,9,2),
+    // parity connections — lower triangular (vg10..11)
+    (0,10,0),
+    (1,10,7),(1,11,0),
 ];
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

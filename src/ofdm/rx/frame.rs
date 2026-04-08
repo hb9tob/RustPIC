@@ -79,7 +79,7 @@ const RS_CODEWORD_BITS: usize = RS_N * 8; // 255 × 8 = 2040
 /// carry exactly one RS codeword of [`RS_CODEWORD_BITS`] bits.
 ///
 /// The last block may carry fewer than `k` payload bits — the tail is padding.
-fn ldpc_blocks_per_rs(k: usize) -> usize {
+pub(crate) fn ldpc_blocks_per_rs(k: usize) -> usize {
     (RS_CODEWORD_BITS + k - 1) / k
 }
 
@@ -285,8 +285,10 @@ impl FrameReceiver {
                 decoder.decode(&block_llrs).bits
             };
 
-            // Extract info bits (convention: bits[0..k])
-            self.info_bits.extend_from_slice(&decoded_bits[..self.ldpc_k]);
+            // Extract info bits from the positions identified during code construction
+            for &col in &self.code.info_cols {
+                self.info_bits.push(decoded_bits[col]);
+            }
             self.ldpc_blocks_decoded += 1;
 
             // When a complete set of blocks covers one RS codeword, decode RS
