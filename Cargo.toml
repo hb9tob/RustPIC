@@ -1,0 +1,23 @@
+[package]
+name        = "rustpic"
+version     = "0.1.0"
+edition     = "2021"
+description = "RustPIC — digital image transmission over narrow-band FM via voice repeaters"
+license     = "MIT"
+
+[lib]
+name = "rustpic"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustpic"
+path = "src/main.rs"
+
+[dependencies]
+rustfft     = "6.2"
+num-complex = "0.4"
+thiserror   = "2"
+tracing     = "0.1"
+
+[dev-dependencies]
+approx = "0.5"
