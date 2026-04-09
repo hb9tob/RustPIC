@@ -7,16 +7,22 @@
 //! # Bit layout  (72 BPSK symbols = 72 bits)
 //!
 //! ```text
-//!  Bits   Field           Width  Notes
-//!  ─────  ──────────────  ─────  ──────────────────────────────────────────
-//!   0–2   modulation        3    see [`Modulation`]  (MSB first)
-//!   3–4   ldpc_rate          2    see [`LdpcRate`]
-//!   5–6   reserved           2    set to 0 on TX, ignored on RX
-//!   7     has_resync         1    1 = periodic re-sync ZC present in frame
-//!   8–23  packet_count      16    number of RS/LDPC packets in this frame
-//!  24–39  crc16             16    CRC-16/CCITT over bits 0–23 (3 bytes)
-//!  40–71  diversity         32    bits 0–31 repeated for redundancy
+//!  Bits   Field                         Width  Notes
+//!  ─────  ──────────────────────────   ─────  ──────────────────────────────────────────
+//!   0–2   modulation                     3    see [`Modulation`]  (MSB first)
+//!   3–4   ldpc_rate                      2    see [`LdpcRate`]
+//!   5     total_packet_count bit 12      1    MSB of total_packet_count
+//!   6     packet_offset bit 12           1    MSB of packet_offset
+//!   7     has_resync                     1    1 = periodic re-sync ZC present in frame
+//!   8–19  total_packet_count bits 11:0  12    low 12 bits; combined: 13-bit field (max 8191)
+//!  20–31  packet_offset bits 11:0       12    low 12 bits; combined: 13-bit field (max 8191)
+//!  32–47  crc16                         16    CRC-16/CCITT over bits 0–31 (4 bytes)
+//!  48–71  diversity                     24    bits 0–23 repeated for redundancy
 //! ```
+//!
+//! The 13-bit `total_packet_count` supports up to 8191 RS packets ≈ 1.56 MB.
+//! The 13-bit `packet_offset` accommodates all valid frame offsets for any
+//! modulation/rate combination within that payload limit.
 //!
 //! # Decoding pipeline
 //!
@@ -178,8 +184,13 @@ pub struct ModeHeader {
     pub ldpc_rate: LdpcRate,
     /// Whether periodic re-sync ZC symbols are present in the data block.
     pub has_resync: bool,
-    /// Total number of RS/LDPC-coded payload packets in this super-frame.
-    pub packet_count: u16,
+    /// Total RS packets in the **whole transmission** (across all super-frames).
+    /// Encoded as 13-bit value (max 8191 = ~1.56 MB).
+    pub total_packet_count: u16,
+    /// Index of the first RS packet carried by **this** super-frame.
+    /// `0` for the first (or only) super-frame.
+    /// Encoded as 13-bit value (max 8191).
+    pub packet_offset: u16,
     /// CRC-16 check result (`true` = header integrity verified).
     pub crc_ok: bool,
 }
@@ -187,8 +198,9 @@ pub struct ModeHeader {
 impl std::fmt::Display for ModeHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f,
-            "mode={} ldpc={} pkts={} resync={} crc={}",
-            self.modulation, self.ldpc_rate, self.packet_count,
+            "mode={} ldpc={} pkts={}/{} resync={} crc={}",
+            self.modulation, self.ldpc_rate,
+            self.packet_offset, self.total_packet_count,
             self.has_resync, if self.crc_ok { "OK" } else { "FAIL" }
         )
     }
@@ -289,35 +301,39 @@ pub fn decode_mode_header(
         .collect(); // 0 or 1, MSB at index 0
 
     // ── Diversity combining ───────────────────────────────────────────────────
-    // Layout: raw_bits[0..40] = primary (40 bits)
-    //         raw_bits[40..72] = diversity copy of bits[0..32] (32 bits)
+    // Layout: raw_bits[0..48] = primary (48 bits)
+    //         raw_bits[48..72] = diversity copy of bits[0..24] (24 bits)
     //
-    // Bits 0–31 have a redundant copy; bits 32–39 (CRC low byte) are primary only.
+    // Bits 0–23 have a redundant copy; bits 24–47 (CRC) are primary only.
     // If both copies agree → confident.  If they disagree → keep primary
     // (CRC will catch uncorrectable errors).
-    let mut bits = vec![0u8; 40];
-    for i in 0..32 {
+    let mut bits = vec![0u8; 48];
+    for i in 0..24 {
         let p = raw_bits[i];
-        let d = raw_bits[40 + i];
+        let d = raw_bits[48 + i];
         bits[i] = if p == d { p } else { p }; // prefer primary on disagreement
     }
-    bits[32..40].copy_from_slice(&raw_bits[32..40]); // primary only
+    bits[24..48].copy_from_slice(&raw_bits[24..48]); // primary only (includes CRC)
 
     // ── Field extraction ──────────────────────────────────────────────────────
-    let modulation_code = bits_to_u8(&bits[0..3]);
-    let ldpc_rate_code  = bits_to_u8(&bits[3..5]);
-    // bits[5..7] reserved
-    let has_resync   = bits[7] == 1;
-    let packet_count = bits_to_u16(&bits[8..24]);
-    let crc_received = bits_to_u16(&bits[24..40]);
+    let modulation_code    = bits_to_u8(&bits[0..3]);
+    let ldpc_rate_code     = bits_to_u8(&bits[3..5]);
+    // bit 5: MSB (bit 12) of total_packet_count
+    // bit 6: MSB (bit 12) of packet_offset
+    let has_resync         = bits[7] == 1;
+    let total_packet_count = bits_to_u16(&bits[8..20])    // low 12 bits
+                           | (u16::from(bits[5]) << 12);  // + bit 12
+    let packet_offset      = bits_to_u16(&bits[20..32])   // low 12 bits
+                           | (u16::from(bits[6]) << 12);  // + bit 12
+    let crc_received       = bits_to_u16(&bits[32..48]);
 
     let modulation = Modulation::from_u8(modulation_code)
         .ok_or(ModeError::InvalidModulation(modulation_code))?;
     let ldpc_rate = LdpcRate::from_u8(ldpc_rate_code)
         .ok_or(ModeError::InvalidLdpcRate(ldpc_rate_code))?;
 
-    // ── CRC-16/CCITT over the first 3 bytes (bits 0–23) ──────────────────────
-    let payload_bytes = bits_to_bytes(&bits[0..24]);
+    // ── CRC-16/CCITT over the first 4 bytes (bits 0–31) ──────────────────────
+    let payload_bytes = bits_to_bytes(&bits[0..32]);
     let crc_computed  = crc16_ccitt(&payload_bytes);
     let crc_ok        = crc_computed == crc_received;
 
@@ -328,7 +344,7 @@ pub fn decode_mode_header(
         });
     }
 
-    Ok(ModeHeader { modulation, ldpc_rate, has_resync, packet_count, crc_ok })
+    Ok(ModeHeader { modulation, ldpc_rate, has_resync, total_packet_count, packet_offset, crc_ok })
 }
 
 // ── Zero-forcing equaliser ─────────────────────────────────────────────────────
@@ -374,32 +390,40 @@ fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
 /// This is the **TX** counterpart to [`decode_mode_header`], kept here so the
 /// bit layout is defined in a single place.
 pub fn encode_mode_header(hdr: &ModeHeader) -> Vec<f32> {
-    let mut bits = vec![0u8; 40];
+    let mut bits = vec![0u8; 48];
 
     // Field packing (MSB first)
-    pack_bits_u8(&mut bits[0..3],  hdr.modulation as u8, 3);
-    pack_bits_u8(&mut bits[3..5],  hdr.ldpc_rate  as u8, 2);
-    // bits[5..7] reserved = 0
+    pack_bits_u8 (&mut bits[0..3],   hdr.modulation         as u8,  3);
+    pack_bits_u8 (&mut bits[3..5],   hdr.ldpc_rate          as u8,  2);
+    // bit 5: MSB (bit 12) of total_packet_count
+    bits[5] = ((hdr.total_packet_count >> 12) & 1) as u8;
+    // bit 6: MSB (bit 12) of packet_offset
+    bits[6] = ((hdr.packet_offset >> 12) & 1) as u8;
     bits[7] = u8::from(hdr.has_resync);
-    pack_bits_u16(&mut bits[8..24], hdr.packet_count);
+    pack_bits    (&mut bits[8..20],  hdr.total_packet_count, 12);   // low 12 bits
+    pack_bits    (&mut bits[20..32], hdr.packet_offset,      12);   // low 12 bits
 
-    // CRC-16 over first 3 bytes
-    let payload_bytes = bits_to_bytes(&bits[0..24]);
+    // CRC-16 over first 4 bytes (bits 0–31)
+    let payload_bytes = bits_to_bytes(&bits[0..32]);
     let crc = crc16_ccitt(&payload_bytes);
-    pack_bits_u16(&mut bits[24..40], crc);
+    pack_bits_u16(&mut bits[32..48], crc);
 
-    // 72-bit output: primary (40) + repeat first 32
+    // 72-bit output: primary (48) + diversity = repeat first 24 bits
     let mut out = bits.clone();
-    out.extend_from_slice(&bits[0..32]);
+    out.extend_from_slice(&bits[0..24]);
 
     // Map 0 → −1, 1 → +1
     out.iter().map(|&b| if b == 1 { 1.0f32 } else { -1.0f32 }).collect()
 }
 
-fn pack_bits_u8(dst: &mut [u8], val: u8, nbits: usize) {
+fn pack_bits(dst: &mut [u8], val: u16, nbits: usize) {
     for i in 0..nbits {
-        dst[i] = (val >> (nbits - 1 - i)) & 1;
+        dst[i] = ((val >> (nbits - 1 - i)) & 1) as u8;
     }
+}
+
+fn pack_bits_u8(dst: &mut [u8], val: u8, nbits: usize) {
+    pack_bits(dst, val as u16, nbits);
 }
 
 fn pack_bits_u16(dst: &mut [u8], val: u16) {
@@ -440,11 +464,12 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip() {
         let hdr_tx = ModeHeader {
-            modulation:   Modulation::Qam16,
-            ldpc_rate:    LdpcRate::R3_4,
-            has_resync:   true,
-            packet_count: 42,
-            crc_ok:       true,
+            modulation:         Modulation::Qam16,
+            ldpc_rate:          LdpcRate::R3_4,
+            has_resync:         true,
+            total_packet_count: 42,
+            packet_offset:      7,
+            crc_ok:             true,
         };
 
         // Encode → 72 BPSK symbols (+1/−1)
@@ -469,10 +494,11 @@ mod tests {
         let hdr_rx = decode_mode_header(hdr_fft_win, &h_est)
             .expect("decode must succeed on flat channel");
 
-        assert_eq!(hdr_rx.modulation,   hdr_tx.modulation);
-        assert_eq!(hdr_rx.ldpc_rate,    hdr_tx.ldpc_rate);
-        assert_eq!(hdr_rx.has_resync,   hdr_tx.has_resync);
-        assert_eq!(hdr_rx.packet_count, hdr_tx.packet_count);
+        assert_eq!(hdr_rx.modulation,         hdr_tx.modulation);
+        assert_eq!(hdr_rx.ldpc_rate,          hdr_tx.ldpc_rate);
+        assert_eq!(hdr_rx.has_resync,         hdr_tx.has_resync);
+        assert_eq!(hdr_rx.total_packet_count, hdr_tx.total_packet_count);
+        assert_eq!(hdr_rx.packet_offset,      hdr_tx.packet_offset);
         assert!(hdr_rx.crc_ok);
     }
 
@@ -500,7 +526,10 @@ mod tests {
             for &r in &[LdpcRate::R1_2, LdpcRate::R2_3, LdpcRate::R3_4, LdpcRate::R5_6] {
                 let hdr = ModeHeader {
                     modulation: m, ldpc_rate: r,
-                    has_resync: false, packet_count: 100, crc_ok: true,
+                    has_resync: false,
+                    total_packet_count: 100,
+                    packet_offset: 0,
+                    crc_ok: true,
                 };
                 let syms = encode_mode_header(&hdr);
                 assert_eq!(syms.len(), NUM_CARRIERS);

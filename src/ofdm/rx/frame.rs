@@ -62,7 +62,7 @@ use crate::ofdm::params::*;
 use crate::ofdm::rx::{
     demapper::demap,
     equalizer::SymbolEqualizer,
-    mode_detect::{ModeHeader, Modulation},
+    mode_detect::{LdpcRate, ModeHeader, Modulation},
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -73,6 +73,14 @@ const LDPC_N: usize = 252;
 /// RS codeword length in bits.
 const RS_CODEWORD_BITS: usize = RS_N * 8; // 255 × 8 = 2040
 
+/// Maximum OFDM data symbols per super-frame.
+///
+/// At ±20 ppm and SYMBOL_LEN = 288, the per-symbol clock drift is
+/// 288 × 20×10⁻⁶ ≈ 0.00576 samples.  The CP absorbs up to CP/2 = 16 samples,
+/// reached after ≈ 2 778 symbols.  1 400 symbols keeps the drift below 8 samples
+/// (half that), providing comfortable margin.
+pub const MAX_DATA_SYMS_PER_FRAME: usize = 1_400;
+
 // ── Helper: LDPC blocks per RS codeword ───────────────────────────────────────
 
 /// Returns how many LDPC blocks (each carrying `k` info bits) are needed to
@@ -81,6 +89,21 @@ const RS_CODEWORD_BITS: usize = RS_N * 8; // 255 × 8 = 2040
 /// The last block may carry fewer than `k` payload bits — the tail is padding.
 pub(crate) fn ldpc_blocks_per_rs(k: usize) -> usize {
     (RS_CODEWORD_BITS + k - 1) / k
+}
+
+/// Maximum RS packets (each carrying [`RS_K`] payload bytes) that fit within
+/// [`MAX_DATA_SYMS_PER_FRAME`] OFDM data symbols for the given modulation and
+/// LDPC rate.
+///
+/// Both the TX (`build_transmission`) and RX (`FrameReceiver`) must use this
+/// function with identical arguments to agree on the per-frame packet boundary.
+pub fn max_packets_per_frame(modulation: Modulation, ldpc_rate: LdpcRate) -> usize {
+    let bps   = modulation.bits_per_symbol();
+    let code  = LdpcCode::for_rate(ldpc_rate);
+    let bpr   = ldpc_blocks_per_rs(code.k);
+    // OFDM data symbols needed for one RS packet (ceiling)
+    let syms  = (bpr * LDPC_N).div_ceil(NUM_DATA * bps);
+    (MAX_DATA_SYMS_PER_FRAME / syms).max(1)
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -119,6 +142,9 @@ pub struct FrameMetrics {
     /// Value 1.0 means no budget was used; 0.0 means budget was exactly exhausted.
     /// Stays at 1.0 if no RS packet succeeded.
     pub rs_margin_frac: f32,
+
+    /// Indices of LDPC blocks that did not converge (0-based, empty if all converged).
+    pub failing_block_indices: Vec<u32>,
 }
 
 /// Decoded super-frame payload.
@@ -228,10 +254,17 @@ impl FrameReceiver {
     /// * `channel_est` — [`NUM_CARRIERS`] complex channel coefficients from the ZC preamble.
     /// * `alpha`       — EMA tracking coefficient for the channel equalizer (0.05 … 0.3).
     pub fn new(header: &ModeHeader, channel_est: &[Complex32], alpha: f32) -> Self {
-        let code         = LdpcCode::for_rate(header.ldpc_rate);
-        let ldpc_k       = code.k;
+        let code          = LdpcCode::for_rate(header.ldpc_rate);
+        let ldpc_k        = code.k;
         let blocks_per_rs = ldpc_blocks_per_rs(ldpc_k);
-        let total_ldpc_blocks = header.packet_count as usize * blocks_per_rs;
+
+        // How many RS packets are in THIS super-frame (capped by max_packets_per_frame)
+        let remaining          = header.total_packet_count
+                                    .saturating_sub(header.packet_offset) as usize;
+        let packets_this_frame = remaining
+                                    .min(max_packets_per_frame(header.modulation, header.ldpc_rate));
+
+        let total_ldpc_blocks = packets_this_frame * blocks_per_rs;
         let bits_per_ofdm    = NUM_DATA * header.modulation.bits_per_symbol();
         let total_coded_bits = total_ldpc_blocks * LDPC_N;
         // Ceiling division: may produce slightly more bits than needed (padding).
@@ -262,6 +295,21 @@ impl FrameReceiver {
             rs_erasures_used:     0,
             rs_min_margin_frac:   1.0,
         }
+    }
+
+    /// Total OFDM data symbols (not counting resync ZC or EOT).
+    pub fn total_data_syms(&self) -> usize { self.total_data_syms }
+
+    /// Sets the per-data-symbol timing drift used for clock-drift phase
+    /// pre-correction inside the channel equalizer.
+    ///
+    /// Call this after each resync ZC is located in the receiver loop:
+    /// ```text
+    ///   drift_per_sym = −correction / (RESYNC_PERIOD + 1)
+    /// ```
+    /// where `correction = found_pos_fractional − expected_pos`.
+    pub fn set_timing_drift_per_sym(&mut self, drift_per_sym: f32) {
+        self.equalizer.set_timing_drift_per_sym(drift_per_sym);
     }
 
     /// Total number of OFDM symbols this receiver expects before returning
@@ -302,6 +350,15 @@ impl FrameReceiver {
         let eq = self.equalizer.process(ofdm_symbol);
         self.pilot_snr_sum   += eq.pilot_snr_db;
         self.pilot_snr_count += 1;
+
+        if std::env::var("FRAME_DEBUG").is_ok() {
+            let mean_llr: f32 = if !eq.data.is_empty() {
+                let mean_sq = eq.data.iter().map(|c| c.norm_sqr()).sum::<f32>() / eq.data.len() as f32;
+                mean_sq.sqrt()
+            } else { 0.0 };
+            eprintln!("  [frame.rs] sym={} grp={} snr={:.1}dB mean_eq_amp={:.4}",
+                self.data_syms_received, self.syms_in_group, eq.pilot_snr_db, mean_llr);
+        }
 
         let llrs = demap(&eq.data, &eq.noise_var, self.header.modulation);
         self.llr_buf.extend_from_slice(&llrs);
@@ -459,6 +516,12 @@ impl FrameReceiver {
             0.0
         };
 
+        let failing_block_indices: Vec<u32> = self.ldpc_block_converged.iter()
+            .enumerate()
+            .filter(|(_, &c)| !c)
+            .map(|(i, _)| i as u32)
+            .collect();
+
         let metrics = FrameMetrics {
             channel_ber: if self.channel_bit_total > 0 {
                 self.channel_bit_errors as f32 / self.channel_bit_total as f32
@@ -470,6 +533,7 @@ impl FrameReceiver {
             rs_errors_corrected: self.rs_errors_corrected,
             rs_erasures_used:    self.rs_erasures_used,
             rs_margin_frac:      self.rs_min_margin_frac,
+            failing_block_indices,
         };
 
         PushResult::FrameComplete(FrameResult {
@@ -479,6 +543,95 @@ impl FrameReceiver {
             pilot_snr_db,
             metrics,
         })
+    }
+}
+
+// ── TransmissionReceiver ──────────────────────────────────────────────────────
+
+/// Result returned by [`TransmissionReceiver::push_frame`].
+pub enum TxPushResult {
+    /// More super-frames expected.
+    NeedMoreFrames,
+    /// All super-frames received; full transmission assembled.
+    Complete(TransmissionResult),
+}
+
+/// Assembled result of a complete multi-super-frame transmission.
+#[derive(Debug, Clone)]
+pub struct TransmissionResult {
+    /// Concatenated RS-decoded payload, `total_packet_count × RS_K` bytes.
+    pub payload: Vec<u8>,
+    /// Total RS packets in the whole transmission.
+    pub total_packet_count: u16,
+    /// RS packets that decoded successfully (across all super-frames).
+    pub packets_ok: u16,
+    /// `true` if every super-frame passed its per-frame CRC32 check.
+    pub all_crc32_ok: bool,
+}
+
+/// Reassembles a multi-super-frame transmission from individual [`FrameResult`]s.
+///
+/// Create with the `total_packet_count` from the first super-frame's header,
+/// then call [`push_frame`] for each decoded super-frame in order.
+///
+/// [`push_frame`]: TransmissionReceiver::push_frame
+pub struct TransmissionReceiver {
+    total_packet_count: u16,
+    payload:            Vec<u8>,
+    packets_ok:         u16,
+    all_crc32_ok:       bool,
+}
+
+impl TransmissionReceiver {
+    /// Creates a new receiver for a transmission of `total_packet_count` RS packets.
+    pub fn new(total_packet_count: u16) -> Self {
+        Self {
+            total_packet_count,
+            payload:      vec![0u8; total_packet_count as usize * RS_K],
+            packets_ok:   0,
+            all_crc32_ok: true,
+        }
+    }
+
+    /// Returns `true` if every super-frame pushed so far passed its CRC32 check.
+    pub fn is_all_crc_ok(&self) -> bool { self.all_crc32_ok }
+
+    /// Adds one decoded super-frame.
+    ///
+    /// `result` is the [`FrameResult`] from [`FrameReceiver`]; `header` is the
+    /// decoded mode header for that super-frame.
+    ///
+    /// Returns [`TxPushResult::Complete`] when the last frame is received.
+    pub fn push_frame(&mut self, result: FrameResult, header: &ModeHeader) -> TxPushResult {
+        // Place this frame's RS payload at the right byte offset.
+        let byte_offset = header.packet_offset as usize * RS_K;
+        let copy_len    = result.payload.len().min(
+            self.payload.len().saturating_sub(byte_offset)
+        );
+        if copy_len > 0 {
+            self.payload[byte_offset..byte_offset + copy_len]
+                .copy_from_slice(&result.payload[..copy_len]);
+        }
+        self.packets_ok   += result.packets_ok;
+        self.all_crc32_ok &= result.crc32_ok;
+
+        // Is this the last frame?
+        let remaining          = self.total_packet_count
+                                    .saturating_sub(header.packet_offset) as usize;
+        let packets_this_frame = remaining
+                                    .min(max_packets_per_frame(header.modulation, header.ldpc_rate));
+        let next_offset        = header.packet_offset as usize + packets_this_frame;
+
+        if next_offset >= self.total_packet_count as usize {
+            TxPushResult::Complete(TransmissionResult {
+                payload:            std::mem::take(&mut self.payload),
+                total_packet_count: self.total_packet_count,
+                packets_ok:         self.packets_ok,
+                all_crc32_ok:       self.all_crc32_ok,
+            })
+        } else {
+            TxPushResult::NeedMoreFrames
+        }
     }
 }
 
@@ -589,11 +742,12 @@ mod tests {
     #[test]
     fn expected_symbol_count_no_resync() {
         let header = ModeHeader {
-            modulation:   Modulation::Qam16,   // 4 bps → 252 bits/symbol
-            ldpc_rate:    LdpcRate::R3_4,      // k=189, blocks_per_rs=11
-            has_resync:   false,
-            packet_count: 1,
-            crc_ok:       true,
+            modulation:         Modulation::Qam16,   // 4 bps → 252 bits/symbol
+            ldpc_rate:          LdpcRate::R3_4,      // k=189, blocks_per_rs=11
+            has_resync:         false,
+            total_packet_count: 1,
+            packet_offset:      0,
+            crc_ok:             true,
         };
         let code = LdpcCode::for_rate(header.ldpc_rate);
         let h_est = flat_channel_est();
@@ -611,11 +765,12 @@ mod tests {
     #[test]
     fn expected_symbol_count_with_resync() {
         let header = ModeHeader {
-            modulation:   Modulation::Bpsk,
-            ldpc_rate:    LdpcRate::R1_2,  // k=126, blocks_per_rs=17
-            has_resync:   true,
-            packet_count: 1,
-            crc_ok:       true,
+            modulation:         Modulation::Bpsk,
+            ldpc_rate:          LdpcRate::R1_2,  // k=126, blocks_per_rs=17
+            has_resync:         true,
+            total_packet_count: 1,
+            packet_offset:      0,
+            crc_ok:             true,
         };
         let h_est = flat_channel_est();
         let rx    = FrameReceiver::new(&header, &h_est, 0.1);
@@ -679,9 +834,10 @@ mod tests {
         let header = ModeHeader {
             modulation,
             ldpc_rate,
-            has_resync:   false,
-            packet_count: 1,
-            crc_ok:       true,
+            has_resync:         false,
+            total_packet_count: 1,
+            packet_offset:      0,
+            crc_ok:             true,
         };
         let h_est = flat_channel_est();
         let mut rx = FrameReceiver::new(&header, &h_est, 0.1);

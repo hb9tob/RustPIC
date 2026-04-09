@@ -318,6 +318,99 @@ pub fn correct_cfo(samples: &mut [Complex32], cfo_hz: f32) {
     }
 }
 
+// ── Intra-frame timing correction ─────────────────────────────────────────────
+
+/// Searches for the ZC re-sync symbol within a ±`radius` sample window around
+/// `expected_pos`.
+///
+/// Returns `Some((integer_pos, frac))` where:
+/// * `integer_pos` — the integer sample index of the best-matching ZC start.
+/// * `frac`        — sub-sample fractional offset `∈ (−0.5, 0.5]` obtained by
+///   quadratic interpolation of the correlation peak.  Adding it to
+///   `integer_pos` gives the estimated ZC position with sub-sample precision.
+///
+/// Returns `None` if the peak correlation falls below `min_metric`.
+///
+/// Used by the receiver loop to track clock-drift continuously.
+///
+/// # Typical usage
+///
+/// ```text
+/// if is_resync_position {
+///     if let Some((found, frac)) = find_resync_zc(&samples, expected, 64, 0.20) {
+///         let correction = found as f64 + frac as f64 - expected as f64;
+///         timing_offset_frac += correction;
+///         drift_per_sym = -correction / (RESYNC_PERIOD as f64 + 1.0);
+///     }
+/// }
+/// ```
+pub fn find_resync_zc(
+    samples:      &[Complex32],
+    expected_pos: usize,
+    radius:       usize,
+    min_metric:   f32,
+) -> Option<(usize, f32)> {
+    let search_start = expected_pos.saturating_sub(radius);
+    let search_end   = (expected_pos + radius + 1)
+                           .min(samples.len().saturating_sub(SYMBOL_LEN));
+
+    // Build ZC reference in time domain (CP-stripped, length FFT_SIZE)
+    let zc_ref: Vec<Complex32> = {
+        let zc_freq = zc_freq_reference();
+        let mut freq_buf = vec![Complex32::new(0.0, 0.0); FFT_SIZE];
+        for k in 0..NUM_CARRIERS {
+            freq_buf[carrier_to_bin(k)] = zc_freq[k];
+        }
+        let mut planner = FftPlanner::<f32>::new();
+        planner.plan_fft_inverse(FFT_SIZE).process(&mut freq_buf);
+        let scale = 1.0 / (FFT_SIZE as f32).sqrt();
+        freq_buf.iter().map(|s| s * scale).collect()
+    };
+
+    let ref_energy: f32 = zc_ref.iter().map(|s| s.norm_sqr()).sum::<f32>().sqrt();
+
+    // Helper: normalised correlation metric at one integer position.
+    let metric_at = |pos: usize| -> f32 {
+        let win_start = pos + CP_LEN;
+        if win_start + FFT_SIZE > samples.len() { return 0.0; }
+        let window = &samples[win_start..win_start + FFT_SIZE];
+        let dot: Complex32 = window.iter().zip(zc_ref.iter())
+            .map(|(&s, &r)| s * r.conj())
+            .sum();
+        let win_energy: f32 = window.iter().map(|s| s.norm_sqr()).sum::<f32>().sqrt();
+        let denom = win_energy * ref_energy;
+        if denom > 1e-12 { dot.norm() / denom } else { 0.0 }
+    };
+
+    let mut best_metric = 0.0f32;
+    let mut best_pos    = expected_pos;
+
+    for pos in search_start..search_end {
+        let m = metric_at(pos);
+        if m > best_metric {
+            best_metric = m;
+            best_pos    = pos;
+        }
+    }
+
+    if best_metric < min_metric {
+        return None;
+    }
+
+    // ── Sub-sample interpolation: quadratic fit of peak and its neighbours ──
+    // Parabolic interpolation: δ = 0.5 × (m₋₁ − m₊₁) / (m₋₁ − 2m₀ + m₊₁)
+    let m_minus = if best_pos > search_start { metric_at(best_pos - 1) } else { 0.0 };
+    let m_plus  = if best_pos + 1 < search_end { metric_at(best_pos + 1) } else { 0.0 };
+    let denom   = m_minus - 2.0 * best_metric + m_plus;
+    let frac    = if denom.abs() > 1e-10 {
+        0.5 * (m_minus - m_plus) / denom
+    } else {
+        0.0f32
+    };
+
+    Some((best_pos, frac.clamp(-0.5, 0.5)))
+}
+
 // ── Channel estimation ─────────────────────────────────────────────────────────
 
 /// Estimates the per-subcarrier complex channel response H[k] from the FFT

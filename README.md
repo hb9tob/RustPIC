@@ -37,10 +37,13 @@ Image → WebP encode → payload bytes
 | Field | Details |
 |---|---|
 | Preamble | Two identical Zadoff–Chu symbols (ZC_ROOT=25, SYMBOL_LEN=288) |
-| Mode header | BPSK + CRC-16/CCITT, 32-bit diversity repeat — encodes modulation, LDPC rate, packet count |
-| Data symbols | BPSK / QPSK / 16-QAM — 63 data + 9 pilot subcarriers per symbol |
-| Re-sync ZC | Optional, inserted every 12 data symbols for long frames |
+| Mode header | BPSK + CRC-16/CCITT, 32-bit diversity repeat — encodes modulation, LDPC rate, packet count/offset |
+| Data symbols | BPSK / QPSK / 16-QAM / 32-QAM / 64-QAM — 63 data + 9 pilot subcarriers per symbol |
+| Re-sync ZC | Optional, inserted every 12 data symbols — maintains timing over long frames |
 | EOT | CRC-32/IEEE-802.3 of the payload in the first 32 data subcarriers (BPSK) |
+
+Large payloads are split across multiple super-frames. The mode header carries a 13-bit
+`packet_offset` field so the receiver can reassemble them in order.
 
 ### FEC
 
@@ -50,6 +53,16 @@ Image → WebP encode → payload bytes
 | Inner | LDPC (QC, scaled min-sum) | n=252, rates 1/2 / 2/3 / 3/4 / 5/6 |
 
 Failed LDPC blocks are passed to RS as erasures, maximising correction budget utilisation.
+
+### Modulations
+
+| Mode | bps | Min SNR | Use case |
+|------|-----|---------|----------|
+| BPSK | 1 | ~4 dB | Very weak signals |
+| QPSK | 2 | ~7 dB | Marginal links |
+| 16-QAM | 4 | ~12 dB | Normal links |
+| 32-QAM | 5 | ~15 dB | Good links |
+| 64-QAM | 6 | ~21 dB | Excellent links |
 
 ---
 
@@ -69,14 +82,14 @@ src/
     ├── params.rs                 system constants
     ├── zc.rs                     Zadoff–Chu preamble
     ├── rx/
-    │   ├── sync.rs               ZC correlator, CFO estimator, channel estimator
+    │   ├── sync.rs               ZC correlator, CFO estimator, channel estimator, resync
     │   ├── mode_detect.rs        mode-header encoder/decoder
-    │   ├── equalizer.rs          pilot-based EMA channel equalizer
-    │   ├── demapper.rs           soft LLR demapper (BPSK/QPSK/16-QAM)
+    │   ├── equalizer.rs          pilot-based EMA channel equalizer with drift compensation
+    │   ├── demapper.rs           soft LLR demapper (BPSK/QPSK/16/32/64-QAM)
     │   └── frame.rs              FrameReceiver — full RX pipeline, FrameMetrics
     └── tx/
         ├── mod.rs                OFDM modulator, constellation mapper
-        └── frame.rs              build_frame — complete TX assembler
+        └── frame.rs              build_transmission — multi-frame TX assembler
 ```
 
 ---
@@ -110,24 +123,28 @@ OPTIONS:
   --guard N          Max guard samples              [default: 1000]
   --runs N           Frames per SNR point           [default: 10]
   --rate RATE        LDPC rate: 1/2 2/3 3/4 5/6     [default: 1/2]
-  --mod MOD          Modulation: bpsk qpsk 16qam    [default: bpsk]
+  --mod MOD          Modulation: bpsk qpsk 16qam 32qam 64qam  [default: bpsk]
   --payload-size N   Payload bytes                  [default: 191]
   --resync           Enable re-sync ZC symbols
 ```
 
-Example (QPSK, rate 3/4, with all impairments):
+Example — 64-QAM R3/4, 100 KB payload, ±10 ppm clock offset, resync enabled:
 
 ```
-$ cargo run --release --bin simtest -- --mod qpsk --rate 3/4 --snr-min 2 --snr-max 12
+$ cargo run --release --bin simtest -- \
+    --mod 64qam --rate 3/4 --payload-size 100000 \
+    --snr-min 18 --snr-max 30 --snr-step 1 --ppm 10 --runs 50 --resync
 
  SNR(dB)   ch.BER%   LDPC_ok%  LDPC_fail%   RS_ok%  RS_fail%   RS_margin%  CRC32_ok%
 ------------------------------------------------------------------------------------
-     2.0      3.61       48.5        51.5     33.3      66.7         76.7       33.3
-     4.0      1.40       83.6        16.4     80.0      20.0         83.6       80.0
-     6.0      0.55       95.5         4.5     95.0       5.0         97.5       95.0
-     8.0      0.10       99.5         0.5    100.0       0.0         98.1      100.0
-    10.0      0.01      100.0         0.0    100.0       0.0        100.0      100.0
-    12.0      0.00      100.0         0.0    100.0       0.0        100.0      100.0
+    18.0      0.34       98.7         1.3     99.5       0.5         20.8       46.0
+    19.0      0.16       99.6         0.4    100.0       0.0         42.5       88.0
+    20.0      0.10       99.8         0.2     99.9       0.1         53.1       88.0
+    21.0      0.04      100.0         0.0    100.0       0.0         75.5      100.0
+    22.0      0.02      100.0         0.0    100.0       0.0         93.1      100.0
+    23.0      0.01      100.0         0.0    100.0       0.0         96.2      100.0
+    24.0      0.00      100.0         0.0    100.0       0.0         99.2      100.0
+    25.0      0.00      100.0         0.0    100.0       0.0        100.0      100.0
 ```
 
 ---

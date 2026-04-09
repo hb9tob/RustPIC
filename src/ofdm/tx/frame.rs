@@ -27,7 +27,7 @@ use crate::fec::rs::RS_K;
 use crate::ofdm::{
     params::*,
     rx::{
-        frame::{crc32_ieee, ldpc_blocks_per_rs},
+        frame::{crc32_ieee, ldpc_blocks_per_rs, max_packets_per_frame},
         mode_detect::{encode_mode_header, LdpcRate, ModeHeader, Modulation},
     },
     tx::{bits_to_symbol, ofdm_modulate, ofdm_modulate_all_carriers},
@@ -49,78 +49,115 @@ pub struct FrameConfig {
 
 // ── Frame builder ─────────────────────────────────────────────────────────────
 
-/// Encodes `payload` bytes and assembles the complete super-frame sample
-/// stream.
+/// Encodes `payload` bytes into one or more super-frame sample streams.
 ///
-/// # Encoding chain
+/// For payloads small enough to fit in a single super-frame this returns a
+/// one-element `Vec`; larger payloads are split automatically so that no frame
+/// exceeds the clock-drift budget (see [`max_packets_per_frame`]).
+///
+/// # Encoding chain (per super-frame)
 ///
 /// ```text
-/// payload  ─┬─ pad to multiple of RS_K ─┐
-///            │  RS(255,191) encode        │  per RS packet
-///            │  flatten to bits           │
-///            │  pad to blocks_per_rs × k  │
-///            └─ LDPC encode (×blocks_per_rs) ─► accumulated coded bits
-///
-/// coded bits ─► OFDM data symbols (NUM_DATA × bps bits each)
+/// frame_payload  ─► RS(255,191) per packet ─► flatten to bits
+///                ─► LDPC encode per block ─► OFDM data symbols
 /// ```
 ///
 /// # Frame structure
 ///
 /// ZC#1 │ ZC#2 │ mode header │ [D×RESYNC_PERIOD │ ZC_resync]* │ D×tail │ EOT
+pub fn build_transmission(payload: &[u8], config: &FrameConfig) -> Vec<Vec<Complex32>> {
+    let rs_k               = RS_K;
+    let total_packet_count = payload.len().div_ceil(rs_k).max(1);
+    let max_per            = max_packets_per_frame(config.modulation, config.ldpc_rate);
+
+    let mut frames         = Vec::new();
+    let mut pkt_offset     = 0usize;
+
+    while pkt_offset < total_packet_count {
+        let packets_this  = (total_packet_count - pkt_offset).min(max_per);
+        let byte_start    = pkt_offset * rs_k;
+        let byte_end      = ((pkt_offset + packets_this) * rs_k).min(payload.len());
+        let frame_payload = if byte_start < payload.len() {
+            &payload[byte_start..byte_end]
+        } else {
+            &[]
+        };
+        frames.push(build_frame_internal(
+            frame_payload,
+            config,
+            pkt_offset         as u16,
+            total_packet_count as u16,
+            packets_this,
+        ));
+        pkt_offset += packets_this;
+    }
+
+    frames
+}
+
+/// Convenience wrapper for single-frame transmissions.
 ///
-/// The EOT OFDM symbol carries the CRC32 of `payload` on the first 32 data
-/// subcarriers as BPSK (MSB first); the remaining subcarriers are set to +1.
-///
-/// # Packet count
-///
-/// `packet_count` in the mode header = `⌈payload.len() / RS_K⌉`.
-/// The last RS packet is zero-padded to [`RS_K`] bytes if needed.
+/// Panics if `payload` requires more than one super-frame (use
+/// [`build_transmission`] for large payloads).
 pub fn build_frame(payload: &[u8], config: &FrameConfig) -> Vec<Complex32> {
+    let mut frames = build_transmission(payload, config);
+    assert_eq!(
+        frames.len(), 1,
+        "payload too large for a single super-frame — use build_transmission()"
+    );
+    frames.remove(0)
+}
+
+// ── Internal frame builder ────────────────────────────────────────────────────
+
+fn build_frame_internal(
+    payload:            &[u8],
+    config:             &FrameConfig,
+    packet_offset:      u16,
+    total_packet_count: u16,
+    packets_this_frame: usize,
+) -> Vec<Complex32> {
     let rs      = RsCodec::new();
     let code    = LdpcCode::for_rate(config.ldpc_rate);
     let k       = code.k;
-    let bpr     = ldpc_blocks_per_rs(k); // LDPC blocks per RS codeword
+    let bpr     = ldpc_blocks_per_rs(k);
     let bps     = config.modulation.bits_per_symbol();
+    let rs_k    = RS_K;
 
-    // ── 1. RS-encode + LDPC-encode all payload packets ────────────────────────
-    let rs_k = RS_K;
-    let packet_count = payload.len().div_ceil(rs_k).max(1);
+    // ── 1. RS-encode + LDPC-encode all packets in this frame ─────────────────
     let mut all_coded_bits: Vec<u8> = Vec::new();
 
-    for pkt in 0..packet_count {
+    for pkt in 0..packets_this_frame {
         let start = pkt * rs_k;
         let end   = (start + rs_k).min(payload.len());
 
-        // Zero-pad last packet to RS_K bytes
         let mut pkt_data = vec![0u8; rs_k];
-        pkt_data[..end - start].copy_from_slice(&payload[start..end]);
+        if start < payload.len() {
+            pkt_data[..end - start].copy_from_slice(&payload[start..end]);
+        }
 
-        // RS encode → 255-byte codeword
         let rs_cw = rs.encode(&pkt_data);
 
-        // Flatten RS codeword to bits (MSB first)
         let mut cw_bits: Vec<u8> = rs_cw.iter()
             .flat_map(|&b| (0..8usize).map(move |i| (b >> (7 - i)) & 1))
             .collect();
-        cw_bits.resize(bpr * k, 0); // pad to bpr × k (zero padding after RS bits)
+        cw_bits.resize(bpr * k, 0);
 
-        // LDPC encode each block
         for blk in 0..bpr {
-            let info = &cw_bits[blk * k..(blk + 1) * k];
-            let codeword = code.encode(info); // n = LDPC_N bits
+            let info     = &cw_bits[blk * k..(blk + 1) * k];
+            let codeword = code.encode(info);
             all_coded_bits.extend_from_slice(&codeword);
         }
     }
 
     // ── 2. Slice into OFDM data symbols ───────────────────────────────────────
-    let bits_per_ofdm = NUM_DATA * bps;
-    // Pad coded bits to a multiple of bits_per_ofdm
+    let bits_per_ofdm   = NUM_DATA * bps;
     let total_data_syms = all_coded_bits.len().div_ceil(bits_per_ofdm);
     all_coded_bits.resize(total_data_syms * bits_per_ofdm, 0);
 
     let data_ofdm_syms: Vec<Vec<Complex32>> = (0..total_data_syms)
         .map(|i| {
-            let bits = &all_coded_bits[i * bits_per_ofdm..(i + 1) * bits_per_ofdm];
+            let bits    = &all_coded_bits[i * bits_per_ofdm..(i + 1) * bits_per_ofdm];
             let data_sc: Vec<Complex32> = (0..NUM_DATA)
                 .map(|sym| bits_to_symbol(&bits[sym * bps..], config.modulation))
                 .collect();
@@ -128,25 +165,23 @@ pub fn build_frame(payload: &[u8], config: &FrameConfig) -> Vec<Complex32> {
         })
         .collect();
 
-    // ── 3. Build re-sync ZC symbol ────────────────────────────────────────────
-    // Single ZC (same as ZC#1 of the preamble = first SYMBOL_LEN samples).
+    // ── 3. Re-sync ZC symbol ─────────────────────────────────────────────────
     let resync_sym: Vec<Complex32> = build_preamble()[..SYMBOL_LEN].to_vec();
 
     // ── 4. Assemble sample stream ─────────────────────────────────────────────
     let mut samples: Vec<Complex32> = Vec::new();
 
-    // Preamble: ZC#1 + ZC#2
     let preamble = build_preamble();
     samples.extend_from_slice(&preamble); // ZC#1
     samples.extend_from_slice(&preamble); // ZC#2
 
-    // Mode header
     let header = ModeHeader {
-        modulation:   config.modulation,
-        ldpc_rate:    config.ldpc_rate,
-        has_resync:   config.has_resync,
-        packet_count: packet_count as u16,
-        crc_ok:       true,
+        modulation:         config.modulation,
+        ldpc_rate:          config.ldpc_rate,
+        has_resync:         config.has_resync,
+        total_packet_count,
+        packet_offset,
+        crc_ok:             true,
     };
     let hdr_bpsk = encode_mode_header(&header);
     let hdr_sc: Vec<Complex32> = hdr_bpsk.iter()
@@ -154,24 +189,19 @@ pub fn build_frame(payload: &[u8], config: &FrameConfig) -> Vec<Complex32> {
         .collect();
     samples.extend_from_slice(&ofdm_modulate_all_carriers(&hdr_sc));
 
-    // Data symbols interleaved with optional re-sync ZCs
     for (data_sym_idx, sym) in data_ofdm_syms.iter().enumerate() {
-        // Insert re-sync ZC BEFORE the first symbol of each new group
-        // (after the first group of RESYNC_PERIOD data symbols)
         if config.has_resync && data_sym_idx > 0 && data_sym_idx % RESYNC_PERIOD == 0 {
             samples.extend_from_slice(&resync_sym);
         }
         samples.extend_from_slice(sym);
     }
 
-    // EOT symbol: CRC32 in first 32 data subcarriers (BPSK, MSB first).
-    // CRC is computed over the zero-padded payload (packet_count × RS_K bytes)
-    // so the RX can recompute it directly over rs_payload without knowing the
-    // original payload length.
+    // EOT: CRC32 over this frame's zero-padded RS payload.
     let crc = {
-        let padded_len = packet_count * rs_k;
+        let padded_len = packets_this_frame * rs_k;
         let mut padded = vec![0u8; padded_len];
-        padded[..payload.len()].copy_from_slice(payload);
+        let copy_len   = payload.len().min(padded_len);
+        padded[..copy_len].copy_from_slice(&payload[..copy_len]);
         crc32_ieee(&padded)
     };
     let eot_sc: Vec<Complex32> = (0..NUM_DATA)
@@ -180,7 +210,7 @@ pub fn build_frame(payload: &[u8], config: &FrameConfig) -> Vec<Complex32> {
                 let bit = (crc >> (31 - i)) & 1;
                 Complex32::new(if bit == 0 { 1.0 } else { -1.0 }, 0.0)
             } else {
-                Complex32::new(1.0, 0.0) // padding → bit 0
+                Complex32::new(1.0, 0.0)
             }
         })
         .collect();
@@ -219,9 +249,9 @@ mod tests {
         let header     = decode_mode_header(hdr_win, &sync.channel_est)
             .unwrap_or_else(|e| panic!("header decode failed: {e}"));
 
-        assert_eq!(header.modulation,   config.modulation);
-        assert_eq!(header.ldpc_rate,    config.ldpc_rate);
-        assert_eq!(header.has_resync,   config.has_resync);
+        assert_eq!(header.modulation,         config.modulation);
+        assert_eq!(header.ldpc_rate,          config.ldpc_rate);
+        assert_eq!(header.has_resync,         config.has_resync);
 
         // Frame receiver
         let mut rx  = FrameReceiver::new(&header, &sync.channel_est, 0.1);
@@ -243,7 +273,7 @@ mod tests {
 
         assert!(frame.crc32_ok,
             "CRC32 failed for {:?}/{:?}", config.modulation, config.ldpc_rate);
-        assert_eq!(frame.packets_ok, header.packet_count,
+        assert_eq!(frame.packets_ok, header.total_packet_count,
             "not all RS packets decoded");
 
         // Verify payload bytes (truncate to original length)

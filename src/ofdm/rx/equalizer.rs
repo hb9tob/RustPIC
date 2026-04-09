@@ -69,11 +69,28 @@ pub struct EqualizedSymbol {
 ///
 /// Maintains a per-subcarrier channel estimate H[k] that is updated symbol by
 /// symbol using exponential moving average (EMA) over the pilot observations.
+///
+/// ## Clock-drift compensation
+///
+/// When the TX and RX clocks differ by `ppm` parts-per-million, each data
+/// symbol `s` (since the last ZC) is read `(s+1)×SYMBOL_LEN×ppm/1e6` samples
+/// late.  This timing error adds a linear-with-bin phase ramp to every
+/// subcarrier.  [`set_timing_drift_per_sym`] stores the estimated drift; each
+/// [`process`] call pre-rotates the frequency-domain samples to cancel it
+/// before the pilot EMA, so the EMA only needs to track residual channel
+/// variation.
+///
+/// [`set_timing_drift_per_sym`]: SymbolEqualizer::set_timing_drift_per_sym
 pub struct SymbolEqualizer {
     /// Current channel estimate for **all** [`NUM_CARRIERS`] active subcarriers.
     h: Vec<Complex32>,
     /// EMA coefficient for pilot-based channel tracking (0 < α ≤ 1).
     alpha: f32,
+    /// Estimated per-data-symbol timing drift in samples (positive = late read).
+    /// Set from consecutive resync ZC positions; 0.0 until first resync.
+    timing_drift_per_sym: f32,
+    /// Count of data symbols processed since the last ZC reset.
+    syms_since_resync: usize,
 }
 
 impl SymbolEqualizer {
@@ -85,17 +102,35 @@ impl SymbolEqualizer {
     /// `alpha`: EMA tracking coefficient.  Typical range 0.05 … 0.3.
     pub fn from_preamble(h_preamble: &[Complex32], alpha: f32) -> Self {
         assert_eq!(h_preamble.len(), NUM_CARRIERS);
-        Self { h: h_preamble.to_vec(), alpha: alpha.clamp(1e-4, 1.0) }
+        Self {
+            h: h_preamble.to_vec(),
+            alpha: alpha.clamp(1e-4, 1.0),
+            timing_drift_per_sym: 0.0,
+            syms_since_resync: 0,
+        }
+    }
+
+    /// Sets the per-data-symbol timing drift in samples.
+    ///
+    /// Estimated from consecutive resync ZC positions in the receiver loop:
+    /// ```text
+    ///   drift_per_sym = −correction / (RESYNC_PERIOD + 1)
+    /// ```
+    /// where `correction = found_pos − expected_pos` (negative when clock is
+    /// faster than TX).  Call this after each resync ZC is located.
+    pub fn set_timing_drift_per_sym(&mut self, drift: f32) {
+        self.timing_drift_per_sym = drift;
     }
 
     /// Re-estimates the channel from a re-sync ZC OFDM symbol (CP included).
     ///
-    /// Call this whenever the RX encounters a periodic re-sync ZC symbol in the
-    /// data block.  Fully replaces the current channel estimate (no EMA blending).
+    /// Fully replaces the current channel estimate (no EMA blending) and resets
+    /// the intra-group symbol counter used for drift pre-correction.
     pub fn resync_from_zc(&mut self, ofdm_symbol: &[Complex32]) {
         assert_eq!(ofdm_symbol.len(), SYMBOL_LEN);
         let fft_window = &ofdm_symbol[CP_LEN..];
         self.h = channel_estimate_from_zc(fft_window);
+        self.syms_since_resync = 0;
     }
 
     // ── Main processing ───────────────────────────────────────────────────────
@@ -112,7 +147,29 @@ impl SymbolEqualizer {
 
         // ── 1. Demodulate ────────────────────────────────────────────────────
         let fft_window = &ofdm_symbol[CP_LEN..];
-        let y = ofdm_demodulate(fft_window); // NUM_CARRIERS complex values
+        let mut y = ofdm_demodulate(fft_window); // NUM_CARRIERS complex values
+
+        // ── 1b. Clock-drift phase pre-correction ─────────────────────────────
+        // A timing error of `d` samples shifts each subcarrier at FFT bin `b` by
+        //   Y[k] = H_true[k] · X[k] · exp(+j·2π·d·b / FFT_SIZE)
+        // We remove this rotation before the pilot EMA so the EMA only needs to
+        // track residual channel changes rather than the growing phase ramp.
+        //
+        // d = (syms_since_resync + 1) × timing_drift_per_sym
+        //   (the +1 accounts for one symbol-period between the ZC and the first
+        //    data symbol after reset)
+        let drift_samples = (self.syms_since_resync as f32 + 1.0) * self.timing_drift_per_sym;
+        if drift_samples.abs() > 1e-9 {
+            use std::f32::consts::PI;
+            for k in 0..NUM_CARRIERS {
+                let phi = 2.0 * PI * drift_samples * carrier_to_bin(k) as f32
+                          / FFT_SIZE as f32;
+                let (sin_phi, cos_phi) = phi.sin_cos();
+                // multiply by exp(−j·phi) = cos(phi) − j·sin(phi)
+                y[k] *= Complex32::new(cos_phi, -sin_phi);
+            }
+        }
+        self.syms_since_resync += 1;
 
         // ── 2. Pilot observation & EMA update ────────────────────────────────
         // pilot_h[p] = channel at the p-th pilot subcarrier (p = 0..NUM_PILOTS)
