@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install MinGW cross-compiler
+        run: sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Build Windows binaries
+        run: cargo build --release --target x86_64-pc-windows-gnu --bin tx --bin rx
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/x86_64-pc-windows-gnu/release/tx.exe
+            target/x86_64-pc-windows-gnu/release/rx.exe
+          body: |
+            ## RustPIC ${{ github.ref_name }}
+
+            ### Utilisation
+
+            **Encoder un fichier en WAV :**
+            ```
+            tx.exe --input photo.jpg --output photo.wav --mod 16qam --rate 3/4
+            ```
+
+            **Décoder un WAV (tous les fichiers présents) :**
+            ```
+            rx.exe --input enregistrement.wav --outdir .
+            ```
+
+            Les deux exécutables sont autonomes, aucune installation requise.
