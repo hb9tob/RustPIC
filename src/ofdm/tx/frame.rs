@@ -164,8 +164,16 @@ pub fn build_frame(payload: &[u8], config: &FrameConfig) -> Vec<Complex32> {
         samples.extend_from_slice(sym);
     }
 
-    // EOT symbol: CRC32 in first 32 data subcarriers (BPSK, MSB first)
-    let crc = crc32_ieee(payload);
+    // EOT symbol: CRC32 in first 32 data subcarriers (BPSK, MSB first).
+    // CRC is computed over the zero-padded payload (packet_count × RS_K bytes)
+    // so the RX can recompute it directly over rs_payload without knowing the
+    // original payload length.
+    let crc = {
+        let padded_len = packet_count * rs_k;
+        let mut padded = vec![0u8; padded_len];
+        padded[..payload.len()].copy_from_slice(payload);
+        crc32_ieee(&padded)
+    };
     let eot_sc: Vec<Complex32> = (0..NUM_DATA)
         .map(|i| {
             if i < 32 {
