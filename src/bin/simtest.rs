@@ -17,6 +17,7 @@
 //!   --runs N         Frames per SNR point             [default: 10]
 //!   --rate RATE      LDPC rate: 1/2 2/3 3/4 5/6       [default: 1/2]
 //!   --mod MOD        Modulation: bpsk qpsk 16qam 32qam 64qam  [default: bpsk]
+//!   --rs-level N     RS protection level: 0 1 2        [default: 1]
 //!   --payload-size N Payload bytes (≥1)               [default: 191]
 //!   --resync         Enable re-sync ZC symbols
 //! ```
@@ -24,7 +25,7 @@
 use rand::{rngs::StdRng, SeedableRng};
 
 use rustpic::{
-    fec::rs::RS_K,
+    fec::rs::RsLevel,
     ofdm::{
         params::{CP_LEN, RESYNC_PERIOD, SYMBOL_LEN},
         rx::{
@@ -49,12 +50,14 @@ struct Config {
     runs:         usize,
     ldpc_rate:    LdpcRate,
     modulation:   Modulation,
+    rs_level:     RsLevel,
     payload_size: usize,
     has_resync:   bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
+        let (_, rs_k, _) = RsLevel::L1.params();
         Self {
             snr_min:      0.0,
             snr_max:      20.0,
@@ -64,7 +67,8 @@ impl Default for Config {
             runs:         10,
             ldpc_rate:    LdpcRate::R1_2,
             modulation:   Modulation::Bpsk,
-            payload_size: RS_K,
+            rs_level:     RsLevel::L1,
+            payload_size: rs_k,
             has_resync:   false,
         }
     }
@@ -84,6 +88,15 @@ fn parse_args() -> Config {
             "--runs"     => { i += 1; cfg.runs          = args[i].parse().expect("--runs"); }
             "--payload-size" => { i += 1; cfg.payload_size = args[i].parse().expect("--payload-size"); }
             "--resync"   => { cfg.has_resync = true; }
+            "--rs-level" => {
+                i += 1;
+                cfg.rs_level = match args[i].as_str() {
+                    "0" => RsLevel::L0,
+                    "1" => RsLevel::L1,
+                    "2" => RsLevel::L2,
+                    l => { eprintln!("unknown rs-level: {l} (0/1/2)"); std::process::exit(1); }
+                };
+            }
             "--rate" => {
                 i += 1;
                 cfg.ldpc_rate = match args[i].as_str() {
@@ -127,6 +140,7 @@ fn print_help() {
     println!("  --runs N           Frames per SNR point           [default: 10]");
     println!("  --rate RATE        LDPC rate: 1/2 2/3 3/4 5/6     [default: 1/2]");
     println!("  --mod MOD          Modulation: bpsk qpsk 16qam 32qam 64qam  [default: bpsk]");
+    println!("  --rs-level N       RS protection: 0=L0 1=L1 2=L2   [default: 1]");
     println!("  --payload-size N   Payload bytes                  [default: 191]");
     println!("  --resync           Enable re-sync ZC symbols");
 }
@@ -152,8 +166,9 @@ fn run_transmission(
     rng:       &mut StdRng,
 ) -> Option<FrameEntry> {
     let tx_frames = build_transmission(payload, frame_cfg);
-    let total_pkt = payload.len().div_ceil(RS_K).max(1) as u16;
-    let mut tx_rx = TransmissionReceiver::new(total_pkt);
+    let (_, rs_k, _) = frame_cfg.rs_level.params();
+    let total_pkt = payload.len().div_ceil(rs_k).max(1) as u16;
+    let mut tx_rx = TransmissionReceiver::new(total_pkt, rs_k);
 
     // Aggregate metrics across super-frames
     let mut sum_ber:           f32 = 0.0;
@@ -201,7 +216,7 @@ fn run_transmission(
                 rx_buf.resize(nominal_end, num_complex::Complex32::new(0.0, 0.0));
             }
         }
-        let max_per        = max_packets_per_frame(header.modulation, header.ldpc_rate);
+        let max_per        = max_packets_per_frame(header.modulation, header.ldpc_rate, header.rs_level);
         let remaining      = header.total_packet_count
                                 .saturating_sub(header.packet_offset) as usize;
         let pkts_this      = remaining.min(max_per);
@@ -421,6 +436,7 @@ fn main() {
     let frame_cfg = FrameConfig {
         modulation: cfg.modulation,
         ldpc_rate:  cfg.ldpc_rate,
+        rs_level:   cfg.rs_level,
         has_resync: cfg.has_resync,
     };
 
@@ -432,8 +448,8 @@ fn main() {
     // ── Header ────────────────────────────────────────────────────────────────
     println!("RustPIC channel simulation");
     println!(
-        "  modulation: {:?}  LDPC: {:?}  resync: {}",
-        cfg.modulation, cfg.ldpc_rate, cfg.has_resync
+        "  modulation: {:?}  LDPC: {:?}  RS: L{}  resync: {}",
+        cfg.modulation, cfg.ldpc_rate, cfg.rs_level as u8, cfg.has_resync
     );
     println!(
         "  ppm ±{:.0}  guard 0..{}  {}/SNR  payload {} B",

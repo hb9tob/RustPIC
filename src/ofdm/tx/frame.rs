@@ -22,12 +22,11 @@
 
 use num_complex::Complex32;
 
-use crate::fec::{ldpc::LdpcCode, rs::RsCodec};
-use crate::fec::rs::RS_K;
+use crate::fec::{ldpc::LdpcCode, rs::{rs_interleave_m, RsCodec, RsLevel}};
 use crate::ofdm::{
     params::*,
     rx::{
-        frame::{crc32_ieee, ldpc_blocks_per_rs, max_packets_per_frame},
+        frame::{blocks_per_rs_group, crc32_ieee, max_packets_per_frame},
         mode_detect::{encode_mode_header, LdpcRate, ModeHeader, Modulation},
     },
     tx::{bits_to_symbol, ofdm_modulate, ofdm_modulate_all_carriers},
@@ -43,6 +42,8 @@ pub struct FrameConfig {
     pub modulation: Modulation,
     /// LDPC code rate.
     pub ldpc_rate:  LdpcRate,
+    /// RS protection level (3 choices, trading throughput for error correction).
+    pub rs_level:   RsLevel,
     /// Insert a re-sync ZC symbol every [`RESYNC_PERIOD`] data symbols.
     pub has_resync: bool,
 }
@@ -66,9 +67,10 @@ pub struct FrameConfig {
 ///
 /// ZC#1 │ ZC#2 │ mode header │ [D×RESYNC_PERIOD │ ZC_resync]* │ D×tail │ EOT
 pub fn build_transmission(payload: &[u8], config: &FrameConfig) -> Vec<Vec<Complex32>> {
-    let rs_k               = RS_K;
+    let (_, rs_k, _)       = config.rs_level.params();
     let total_packet_count = payload.len().div_ceil(rs_k).max(1);
-    let max_per            = max_packets_per_frame(config.modulation, config.ldpc_rate);
+    let max_per            = max_packets_per_frame(
+        config.modulation, config.ldpc_rate, config.rs_level);
 
     let mut frames         = Vec::new();
     let mut pkt_offset     = 0usize;
@@ -117,34 +119,58 @@ fn build_frame_internal(
     total_packet_count: u16,
     packets_this_frame: usize,
 ) -> Vec<Complex32> {
-    let rs      = RsCodec::new();
-    let code    = LdpcCode::for_rate(config.ldpc_rate);
-    let k       = code.k;
-    let bpr     = ldpc_blocks_per_rs(k);
-    let bps     = config.modulation.bits_per_symbol();
-    let rs_k    = RS_K;
+    let code                    = LdpcCode::for_rate(config.ldpc_rate);
+    let k                       = code.k;
+    let (rs_n, rs_k, rs_2t)    = config.rs_level.params();
+    let rs                      = RsCodec::for_level(config.rs_level);
+    let m                       = rs_interleave_m(rs_2t, k);
+    let bpg                     = blocks_per_rs_group(k, rs_n, m);
+    let bps                     = config.modulation.bits_per_symbol();
+    let groups                  = packets_this_frame.div_ceil(m);
 
-    // ── 1. RS-encode + LDPC-encode all packets in this frame ─────────────────
+    // ── 1. RS-encode + M-interleave + LDPC-encode all groups ─────────────────
+    //
+    // Layout for one group (M RS codewords):
+    //   flat[b] = codeword[b % M][b / M]   (byte b of the flat stream)
+    // This spreads a single failed LDPC block across M RS codewords, keeping
+    // the per-codeword erasure count ≤ ⌈k/(8·M)⌉ ≤ RS_2T.
     let mut all_coded_bits: Vec<u8> = Vec::new();
 
-    for pkt in 0..packets_this_frame {
-        let start = pkt * rs_k;
-        let end   = (start + rs_k).min(payload.len());
+    for grp in 0..groups {
+        let pkt_base = grp * m;
 
-        let mut pkt_data = vec![0u8; rs_k];
-        if start < payload.len() {
-            pkt_data[..end - start].copy_from_slice(&payload[start..end]);
+        // Encode M RS codewords (padding codewords are all-zero encoded).
+        let mut codewords: Vec<Vec<u8>> = Vec::with_capacity(m);
+        for i in 0..m {
+            let pkt_idx = pkt_base + i;
+            let mut pkt_data = vec![0u8; rs_k];
+            if pkt_idx < packets_this_frame {
+                let byte_start = pkt_idx * rs_k;
+                let byte_end   = (byte_start + rs_k).min(payload.len());
+                if byte_start < payload.len() {
+                    pkt_data[..byte_end - byte_start]
+                        .copy_from_slice(&payload[byte_start..byte_end]);
+                }
+            }
+            codewords.push(rs.encode(&pkt_data));
         }
 
-        let rs_cw = rs.encode(&pkt_data);
+        // Interleave: flat[b] = codeword[b%M][b/M]
+        let total_bytes = m * rs_n;
+        let mut flat = vec![0u8; total_bytes];
+        for b in 0..total_bytes {
+            flat[b] = codewords[b % m][b / m];
+        }
 
-        let mut cw_bits: Vec<u8> = rs_cw.iter()
+        // Convert flat bytes → bits, zero-pad to bpg×k bits
+        let mut flat_bits: Vec<u8> = flat.iter()
             .flat_map(|&b| (0..8usize).map(move |i| (b >> (7 - i)) & 1))
             .collect();
-        cw_bits.resize(bpr * k, 0);
+        flat_bits.resize(bpg * k, 0);
 
-        for blk in 0..bpr {
-            let info     = &cw_bits[blk * k..(blk + 1) * k];
+        // Encode bpg LDPC blocks
+        for blk in 0..bpg {
+            let info     = &flat_bits[blk * k..(blk + 1) * k];
             let codeword = code.encode(info);
             all_coded_bits.extend_from_slice(&codeword);
         }
@@ -178,6 +204,7 @@ fn build_frame_internal(
     let header = ModeHeader {
         modulation:         config.modulation,
         ldpc_rate:          config.ldpc_rate,
+        rs_level:           config.rs_level,
         has_resync:         config.has_resync,
         total_packet_count,
         packet_offset,
@@ -196,11 +223,12 @@ fn build_frame_internal(
         samples.extend_from_slice(sym);
     }
 
-    // EOT: CRC32 over this frame's zero-padded RS payload.
+    // EOT: CRC32 over groups×M×rs_k bytes — same layout the RX assembles
+    // (real packets zero-padded, padding packets zero-filled).
     let crc = {
-        let padded_len = packets_this_frame * rs_k;
-        let mut padded = vec![0u8; padded_len];
-        let copy_len   = payload.len().min(padded_len);
+        let padded_total = groups * m * rs_k;
+        let mut padded   = vec![0u8; padded_total];
+        let copy_len     = payload.len().min(padded_total);
         padded[..copy_len].copy_from_slice(&payload[..copy_len]);
         crc32_ieee(&padded)
     };
@@ -224,10 +252,13 @@ fn build_frame_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ofdm::rx::{
-        frame::{FrameReceiver, PushResult},
-        mode_detect::decode_mode_header,
-        sync::{correct_cfo, ZcCorrelator},
+    use crate::{
+        fec::rs::RsLevel,
+        ofdm::rx::{
+            frame::{FrameReceiver, PushResult},
+            mode_detect::decode_mode_header,
+            sync::{correct_cfo, ZcCorrelator},
+        },
     };
 
     /// Full loopback: build_frame → feed through the RX pipeline →
@@ -249,9 +280,10 @@ mod tests {
         let header     = decode_mode_header(hdr_win, &sync.channel_est)
             .unwrap_or_else(|e| panic!("header decode failed: {e}"));
 
-        assert_eq!(header.modulation,         config.modulation);
-        assert_eq!(header.ldpc_rate,          config.ldpc_rate);
-        assert_eq!(header.has_resync,         config.has_resync);
+        assert_eq!(header.modulation, config.modulation);
+        assert_eq!(header.ldpc_rate,  config.ldpc_rate);
+        assert_eq!(header.rs_level,   config.rs_level);
+        assert_eq!(header.has_resync, config.has_resync);
 
         // Frame receiver
         let mut rx  = FrameReceiver::new(&header, &sync.channel_est, 0.1);
@@ -273,6 +305,7 @@ mod tests {
 
         assert!(frame.crc32_ok,
             "CRC32 failed for {:?}/{:?}", config.modulation, config.ldpc_rate);
+        // packets_ok counts only real (non-padding) packets
         assert_eq!(frame.packets_ok, header.total_packet_count,
             "not all RS packets decoded");
 
@@ -284,40 +317,48 @@ mod tests {
 
     #[test]
     fn loopback_bpsk_r12_no_resync() {
-        let payload = vec![0u8; RS_K]; // all-zero → trivial LDPC codewords
+        let (_, rs_k, _) = RsLevel::L1.params();
+        let payload = vec![0u8; rs_k]; // all-zero → trivial LDPC codewords
         loopback(&payload, &FrameConfig {
             modulation: Modulation::Bpsk,
             ldpc_rate:  LdpcRate::R1_2,
+            rs_level:   RsLevel::L1,
             has_resync: false,
         });
     }
 
     #[test]
     fn loopback_qpsk_r34_no_resync() {
-        let payload = vec![0u8; RS_K];
+        let (_, rs_k, _) = RsLevel::L1.params();
+        let payload = vec![0u8; rs_k];
         loopback(&payload, &FrameConfig {
             modulation: Modulation::Qpsk,
             ldpc_rate:  LdpcRate::R3_4,
+            rs_level:   RsLevel::L1,
             has_resync: false,
         });
     }
 
     #[test]
     fn loopback_16qam_r56_no_resync() {
-        let payload = vec![0u8; RS_K];
+        let (_, rs_k, _) = RsLevel::L1.params();
+        let payload = vec![0u8; rs_k];
         loopback(&payload, &FrameConfig {
             modulation: Modulation::Qam16,
             ldpc_rate:  LdpcRate::R5_6,
+            rs_level:   RsLevel::L1,
             has_resync: false,
         });
     }
 
     #[test]
     fn loopback_bpsk_r12_with_resync() {
-        let payload = vec![0u8; RS_K];
+        let (_, rs_k, _) = RsLevel::L1.params();
+        let payload = vec![0u8; rs_k];
         loopback(&payload, &FrameConfig {
             modulation: Modulation::Bpsk,
             ldpc_rate:  LdpcRate::R1_2,
+            rs_level:   RsLevel::L1,
             has_resync: true,
         });
     }
@@ -326,11 +367,13 @@ mod tests {
     /// non-trivial data correctly.
     #[test]
     fn loopback_nonzero_payload_bpsk() {
+        let (_, rs_k, _) = RsLevel::L1.params();
         // 191-byte pattern: 0xAA, 0x55, alternating
-        let payload: Vec<u8> = (0..RS_K).map(|i| if i % 2 == 0 { 0xAAu8 } else { 0x55u8 }).collect();
+        let payload: Vec<u8> = (0..rs_k).map(|i| if i % 2 == 0 { 0xAAu8 } else { 0x55u8 }).collect();
         loopback(&payload, &FrameConfig {
             modulation: Modulation::Bpsk,
             ldpc_rate:  LdpcRate::R1_2,
+            rs_level:   RsLevel::L1,
             has_resync: false,
         });
     }

@@ -111,17 +111,15 @@ impl LdpcCode {
 
     /// Returns a pre-built code for the given LDPC rate.
     ///
-    /// Block lengths are small (N = 504) — suitable for testing and low-latency
-    /// applications.  For better performance substitute optimised code matrices.
-    ///
-    /// Codes are generated with a deterministic quasi-cyclic construction
-    /// (circulant size z = 21).
+    /// Codes use circulant size z = 210 (10× the prototype) yielding
+    /// n = 2520 for all rates.  The same quasi-cyclic protograph matrices as
+    /// the z=21 prototype are reused (shifts wrap mod z).
     pub fn for_rate(rate: LdpcRate) -> Self {
         match rate {
-            LdpcRate::R1_2 => qc_ldpc(21, PROTO_R12),
-            LdpcRate::R2_3 => qc_ldpc(21, PROTO_R23),
-            LdpcRate::R3_4 => qc_ldpc(21, PROTO_R34),
-            LdpcRate::R5_6 => qc_ldpc(21, PROTO_R56),
+            LdpcRate::R1_2 => qc_ldpc(210, PROTO_R12),
+            LdpcRate::R2_3 => qc_ldpc(210, PROTO_R23),
+            LdpcRate::R3_4 => qc_ldpc(210, PROTO_R34),
+            LdpcRate::R5_6 => qc_ldpc(210, PROTO_R56),
         }
     }
 
@@ -176,35 +174,49 @@ impl LdpcCode {
 /// * `info_cols`  — non-pivot column indices (length k = n − rank).
 /// * `parity_cols`— pivot column indices (length m = rank(H)).
 /// * `parity_gen` — m × k binary matrix: `parity[i] = parity_gen[i] · info`.
+///
+/// H is stored as packed u64 rows (ceil(n/64) words per row) for fast XOR
+/// operations — critical for n = 2520, m = 1260 (z = 210 codes).
 fn compute_systematic_form(
     check_to_var: &[Vec<usize>],
     n: usize,
     m: usize,
 ) -> (Vec<usize>, Vec<usize>, Vec<Vec<u8>>) {
-    // Build H as m rows of n bits (u8 per bit for simplicity at n=252)
-    let mut h: Vec<Vec<u8>> = vec![vec![0u8; n]; m];
+    let words = n.div_ceil(64);
+
+    // Build H as m rows of `words` packed u64 values.
+    let mut h: Vec<Vec<u64>> = vec![vec![0u64; words]; m];
     for (c, vars) in check_to_var.iter().enumerate() {
-        for &v in vars { h[c][v] = 1; }
+        for &v in vars {
+            h[c][v / 64] |= 1u64 << (v % 64);
+        }
     }
 
-    // ── Gauss–Jordan elimination ──────────────────────────────────────────────
-    let mut pivot_row = 0usize;
+    // ── Gauss–Jordan elimination (packed rows) ────────────────────────────────
+    let mut pivot_row  = 0usize;
     let mut parity_cols: Vec<usize> = Vec::with_capacity(m);
+    let mut prow_buf = vec![0u64; words]; // scratch — avoids per-pivot allocation
 
     'col: for col in 0..n {
-        // Find a row >= pivot_row with a 1 in this column
+        let word = col / 64;
+        let mask = 1u64 << (col % 64);
+
+        // Find a row with a 1 in column `col`
         for r in pivot_row..m {
-            if h[r][col] == 1 {
+            if h[r][word] & mask != 0 {
                 h.swap(pivot_row, r);
                 parity_cols.push(col);
 
-                // Eliminate this column from every other row (full RREF)
+                // Copy pivot row into scratch buffer
+                prow_buf.copy_from_slice(&h[pivot_row]);
+
+                // Eliminate column from all other rows (full RREF)
                 for r2 in 0..m {
-                    if r2 != pivot_row && h[r2][col] == 1 {
-                        let prow = h[pivot_row].clone();
-                        for c2 in 0..n { h[r2][c2] ^= prow[c2]; }
+                    if r2 != pivot_row && h[r2][word] & mask != 0 {
+                        for w in 0..words { h[r2][w] ^= prow_buf[w]; }
                     }
                 }
+
                 pivot_row += 1;
                 if pivot_row == m { break 'col; }
                 continue 'col;
@@ -217,11 +229,15 @@ fn compute_systematic_form(
         parity_cols.iter().copied().collect();
     let info_cols: Vec<usize> = (0..n).filter(|c| !parity_set.contains(c)).collect();
 
-    // ── Parity generation matrix from RREF ───────────────────────────────────
-    // After RREF, row i has pivot in parity_cols[i].  The remaining non-zero
-    // entries in row i are exactly the info columns contributing to parity_cols[i].
+    // ── Parity generation matrix ──────────────────────────────────────────────
+    // After RREF, row i has pivot in parity_cols[i]; non-zero info entries give
+    // the parity formula.
     let parity_gen: Vec<Vec<u8>> = (0..pivot_row)
-        .map(|i| info_cols.iter().map(|&c| h[i][c]).collect())
+        .map(|i| {
+            info_cols.iter().map(|&c| {
+                u8::from(h[i][c / 64] & (1u64 << (c % 64)) != 0)
+            }).collect()
+        })
         .collect();
 
     (info_cols, parity_cols, parity_gen)
@@ -485,7 +501,7 @@ mod tests {
     /// Code dimensions must satisfy n = n_b * z, m = m_b * z, k = n - m.
     #[test]
     fn code_dimensions() {
-        let z = 21usize;
+        let z = 210usize;
         let expected = [
             (LdpcRate::R1_2, 12*z, 6*z),
             (LdpcRate::R2_3, 12*z, 4*z),

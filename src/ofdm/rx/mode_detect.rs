@@ -11,18 +11,16 @@
 //!  ─────  ──────────────────────────   ─────  ──────────────────────────────────────────
 //!   0–2   modulation                     3    see [`Modulation`]  (MSB first)
 //!   3–4   ldpc_rate                      2    see [`LdpcRate`]
-//!   5     total_packet_count bit 12      1    MSB of total_packet_count
-//!   6     packet_offset bit 12           1    MSB of packet_offset
+//!   5–6   rs_level                       2    see [`RsLevel`]  (0=L0, 1=L1, 2=L2)
 //!   7     has_resync                     1    1 = periodic re-sync ZC present in frame
-//!   8–19  total_packet_count bits 11:0  12    low 12 bits; combined: 13-bit field (max 8191)
-//!  20–31  packet_offset bits 11:0       12    low 12 bits; combined: 13-bit field (max 8191)
+//!   8–19  total_packet_count            12    12-bit field (max 4095 RS packets)
+//!  20–31  packet_offset                 12    12-bit field (max 4095)
 //!  32–47  crc16                         16    CRC-16/CCITT over bits 0–31 (4 bytes)
 //!  48–71  diversity                     24    bits 0–23 repeated for redundancy
 //! ```
 //!
-//! The 13-bit `total_packet_count` supports up to 8191 RS packets ≈ 1.56 MB.
-//! The 13-bit `packet_offset` accommodates all valid frame offsets for any
-//! modulation/rate combination within that payload limit.
+//! The 12-bit `total_packet_count` supports up to 4095 RS packets (≥ 500 KB for all
+//! RS levels).  The 12-bit `packet_offset` accommodates all valid frame offsets.
 //!
 //! # Decoding pipeline
 //!
@@ -53,8 +51,10 @@
 
 use num_complex::Complex32;
 
+use crate::fec::rs::RsLevel;
 use crate::ofdm::params::*;
 use crate::ofdm::rx::ofdm_demodulate;
+
 
 // ── Public enumerations ────────────────────────────────────────────────────────
 
@@ -182,14 +182,16 @@ pub struct ModeHeader {
     pub modulation: Modulation,
     /// LDPC code rate.
     pub ldpc_rate: LdpcRate,
+    /// Reed-Solomon protection level (determines RS_K, RS_2T, and interleave M).
+    pub rs_level: RsLevel,
     /// Whether periodic re-sync ZC symbols are present in the data block.
     pub has_resync: bool,
     /// Total RS packets in the **whole transmission** (across all super-frames).
-    /// Encoded as 13-bit value (max 8191 = ~1.56 MB).
+    /// Encoded as 12-bit value (max 4095).
     pub total_packet_count: u16,
     /// Index of the first RS packet carried by **this** super-frame.
     /// `0` for the first (or only) super-frame.
-    /// Encoded as 13-bit value (max 8191).
+    /// Encoded as 12-bit value (max 4095).
     pub packet_offset: u16,
     /// CRC-16 check result (`true` = header integrity verified).
     pub crc_ok: bool,
@@ -198,8 +200,8 @@ pub struct ModeHeader {
 impl std::fmt::Display for ModeHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f,
-            "mode={} ldpc={} pkts={}/{} resync={} crc={}",
-            self.modulation, self.ldpc_rate,
+            "mode={} ldpc={} rs={} pkts={}/{} resync={} crc={}",
+            self.modulation, self.ldpc_rate, self.rs_level,
             self.packet_offset, self.total_packet_count,
             self.has_resync, if self.crc_ok { "OK" } else { "FAIL" }
         )
@@ -235,6 +237,8 @@ pub enum ModeError {
     InvalidModulation(u8),
     /// Decoded LDPC rate code is out of range.
     InvalidLdpcRate(u8),
+    /// Decoded RS level code is out of range.
+    InvalidRsLevel(u8),
     /// CRC mismatch — header bits are likely corrupted.
     CrcFailed { computed: u16, received: u16 },
 }
@@ -250,6 +254,8 @@ impl std::fmt::Display for ModeError {
                 write!(f, "invalid modulation code {v}"),
             Self::InvalidLdpcRate(v) =>
                 write!(f, "invalid LDPC rate code {v}"),
+            Self::InvalidRsLevel(v) =>
+                write!(f, "invalid RS level code {v}"),
             Self::CrcFailed { computed, received } =>
                 write!(f, "CRC-16 failed: computed=0x{computed:04X} received=0x{received:04X}"),
         }
@@ -318,19 +324,18 @@ pub fn decode_mode_header(
     // ── Field extraction ──────────────────────────────────────────────────────
     let modulation_code    = bits_to_u8(&bits[0..3]);
     let ldpc_rate_code     = bits_to_u8(&bits[3..5]);
-    // bit 5: MSB (bit 12) of total_packet_count
-    // bit 6: MSB (bit 12) of packet_offset
+    let rs_level_code      = bits_to_u8(&bits[5..7]);
     let has_resync         = bits[7] == 1;
-    let total_packet_count = bits_to_u16(&bits[8..20])    // low 12 bits
-                           | (u16::from(bits[5]) << 12);  // + bit 12
-    let packet_offset      = bits_to_u16(&bits[20..32])   // low 12 bits
-                           | (u16::from(bits[6]) << 12);  // + bit 12
+    let total_packet_count = bits_to_u16(&bits[8..20]);   // 12-bit field (max 4095)
+    let packet_offset      = bits_to_u16(&bits[20..32]);  // 12-bit field (max 4095)
     let crc_received       = bits_to_u16(&bits[32..48]);
 
     let modulation = Modulation::from_u8(modulation_code)
         .ok_or(ModeError::InvalidModulation(modulation_code))?;
     let ldpc_rate = LdpcRate::from_u8(ldpc_rate_code)
         .ok_or(ModeError::InvalidLdpcRate(ldpc_rate_code))?;
+    let rs_level = RsLevel::from_u8(rs_level_code)
+        .ok_or(ModeError::InvalidRsLevel(rs_level_code))?;
 
     // ── CRC-16/CCITT over the first 4 bytes (bits 0–31) ──────────────────────
     let payload_bytes = bits_to_bytes(&bits[0..32]);
@@ -344,7 +349,7 @@ pub fn decode_mode_header(
         });
     }
 
-    Ok(ModeHeader { modulation, ldpc_rate, has_resync, total_packet_count, packet_offset, crc_ok })
+    Ok(ModeHeader { modulation, ldpc_rate, rs_level, has_resync, total_packet_count, packet_offset, crc_ok })
 }
 
 // ── Zero-forcing equaliser ─────────────────────────────────────────────────────
@@ -393,15 +398,12 @@ pub fn encode_mode_header(hdr: &ModeHeader) -> Vec<f32> {
     let mut bits = vec![0u8; 48];
 
     // Field packing (MSB first)
-    pack_bits_u8 (&mut bits[0..3],   hdr.modulation         as u8,  3);
-    pack_bits_u8 (&mut bits[3..5],   hdr.ldpc_rate          as u8,  2);
-    // bit 5: MSB (bit 12) of total_packet_count
-    bits[5] = ((hdr.total_packet_count >> 12) & 1) as u8;
-    // bit 6: MSB (bit 12) of packet_offset
-    bits[6] = ((hdr.packet_offset >> 12) & 1) as u8;
+    pack_bits_u8 (&mut bits[0..3],   hdr.modulation as u8,  3);
+    pack_bits_u8 (&mut bits[3..5],   hdr.ldpc_rate  as u8,  2);
+    pack_bits_u8 (&mut bits[5..7],   hdr.rs_level   as u8,  2);
     bits[7] = u8::from(hdr.has_resync);
-    pack_bits    (&mut bits[8..20],  hdr.total_packet_count, 12);   // low 12 bits
-    pack_bits    (&mut bits[20..32], hdr.packet_offset,      12);   // low 12 bits
+    pack_bits    (&mut bits[8..20],  hdr.total_packet_count, 12);  // 12-bit field
+    pack_bits    (&mut bits[20..32], hdr.packet_offset,      12);  // 12-bit field
 
     // CRC-16 over first 4 bytes (bits 0–31)
     let payload_bytes = bits_to_bytes(&bits[0..32]);
@@ -466,6 +468,7 @@ mod tests {
         let hdr_tx = ModeHeader {
             modulation:         Modulation::Qam16,
             ldpc_rate:          LdpcRate::R3_4,
+            rs_level:           RsLevel::L1,
             has_resync:         true,
             total_packet_count: 42,
             packet_offset:      7,
@@ -497,6 +500,7 @@ mod tests {
         assert_eq!(hdr_rx.modulation,         hdr_tx.modulation);
         assert_eq!(hdr_rx.ldpc_rate,          hdr_tx.ldpc_rate);
         assert_eq!(hdr_rx.has_resync,         hdr_tx.has_resync);
+        assert_eq!(hdr_rx.rs_level,            hdr_tx.rs_level);
         assert_eq!(hdr_rx.total_packet_count, hdr_tx.total_packet_count);
         assert_eq!(hdr_rx.packet_offset,      hdr_tx.packet_offset);
         assert!(hdr_rx.crc_ok);
@@ -524,18 +528,20 @@ mod tests {
     fn all_modulations_encodable() {
         for &m in Modulation::all_ordered() {
             for &r in &[LdpcRate::R1_2, LdpcRate::R2_3, LdpcRate::R3_4, LdpcRate::R5_6] {
-                let hdr = ModeHeader {
-                    modulation: m, ldpc_rate: r,
-                    has_resync: false,
-                    total_packet_count: 100,
-                    packet_offset: 0,
-                    crc_ok: true,
-                };
-                let syms = encode_mode_header(&hdr);
-                assert_eq!(syms.len(), NUM_CARRIERS);
-                // All symbols must be ±1
-                for &s in &syms {
-                    assert!(s == 1.0 || s == -1.0, "BPSK symbol must be ±1, got {s}");
+                for &rs in &[RsLevel::L0, RsLevel::L1, RsLevel::L2] {
+                    let hdr = ModeHeader {
+                        modulation: m, ldpc_rate: r,
+                        rs_level: rs,
+                        has_resync: false,
+                        total_packet_count: 100,
+                        packet_offset: 0,
+                        crc_ok: true,
+                    };
+                    let syms = encode_mode_header(&hdr);
+                    assert_eq!(syms.len(), NUM_CARRIERS);
+                    for &s in &syms {
+                        assert!(s == 1.0 || s == -1.0, "BPSK symbol must be ±1, got {s}");
+                    }
                 }
             }
         }

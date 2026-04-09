@@ -106,8 +106,67 @@ impl Gf256 {
 
 impl Default for Gf256 { fn default() -> Self { Self::new() } }
 
+// ── RS level ──────────────────────────────────────────────────────────────────
+
+/// Selectable Reed-Solomon protection level.
+///
+/// All three variants use RS(255, k) over GF(2⁸) (n = 255 always).
+/// Stronger levels add more parity bytes at the cost of throughput.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RsLevel {
+    /// RS(255, 239) — 2t = 16 parity bytes.  Light overhead, high throughput.
+    L0 = 0,
+    /// RS(255, 191) — 2t = 64 parity bytes.  Balanced (default).
+    L1 = 1,
+    /// RS(255, 127) — 2t = 128 parity bytes.  Strong protection.
+    L2 = 2,
+}
+
+impl RsLevel {
+    /// Returns (n, k, two_t) for this RS level.
+    pub fn params(self) -> (usize, usize, usize) {
+        match self {
+            RsLevel::L0 => (255, 239, 16),
+            RsLevel::L1 => (255, 191, 64),
+            RsLevel::L2 => (255, 127, 128),
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::L0),
+            1 => Some(Self::L1),
+            2 => Some(Self::L2),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RsLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RsLevel::L0 => write!(f, "RS(255,239)/2t=16"),
+            RsLevel::L1 => write!(f, "RS(255,191)/2t=64"),
+            RsLevel::L2 => write!(f, "RS(255,127)/2t=128"),
+        }
+    }
+}
+
+/// Returns the RS interleave factor M for the given RS `two_t` and LDPC info
+/// dimension `ldpc_k`.
+///
+/// M is the minimum number of RS codewords that must be processed in parallel
+/// so that a single failed LDPC block (which erases `⌈ldpc_k/8⌉` bytes) causes
+/// at most `two_t` erasures in each individual RS codeword.
+pub fn rs_interleave_m(two_t: usize, ldpc_k: usize) -> usize {
+    let bytes_per_fail = ldpc_k.div_ceil(8);
+    bytes_per_fail.div_ceil(two_t).max(1)
+}
+
 // ── RS codec ──────────────────────────────────────────────────────────────────
 
+/// Level-1 constants kept for backward compatibility and tests.
 pub const RS_N:  usize = 255;
 pub const RS_K:  usize = 191;
 pub const RS_2T: usize = 64;
@@ -122,60 +181,64 @@ pub struct RsDecodeStats {
     pub erasures_used: usize,
 }
 
-/// RS(255, 191) codec.
+/// Parametric RS(255, k) codec.  Use [`RsCodec::for_level`] to create.
 pub struct RsCodec {
-    gf:  Gf256,
-    gen: Vec<u8>, // generator polynomial, degree 64, gen[64] = 1
+    gf:       Gf256,
+    gen:      Vec<u8>,
+    /// Codeword length (always 255).
+    pub n:    usize,
+    /// Information symbols.
+    pub k:    usize,
+    /// Number of parity symbols (= n − k).
+    pub two_t: usize,
 }
 
 impl RsCodec {
-    pub fn new() -> Self {
+    /// Creates a Level-1 codec (backward-compatible default).
+    pub fn new() -> Self { Self::for_level(RsLevel::L1) }
+
+    /// Creates a codec for the given RS level.
+    pub fn for_level(level: RsLevel) -> Self {
+        let (n, k, two_t) = level.params();
         let gf  = Gf256::new();
-        let gen = build_generator(&gf);
-        Self { gf, gen }
+        let gen = build_generator(&gf, two_t);
+        Self { gf, gen, n, k, two_t }
     }
 
     // ── Encoder ───────────────────────────────────────────────────────────────
 
-    /// Encodes `data` (191 bytes) into a 255-byte systematic codeword.
+    /// Encodes `data` (k bytes) into a 255-byte systematic codeword.
     ///
-    /// Layout: `[ parity(0..64) | info(64..255) ]`
-    ///
-    /// `c(x) = r(x) + m(x)·x^{2t}` where `r = m(x)·x^{2t} mod g(x)`.
+    /// Layout: `[ parity(0..two_t) | info(two_t..255) ]`
     pub fn encode(&self, data: &[u8]) -> Vec<u8> {
-        assert_eq!(data.len(), RS_K);
-        let gf  = &self.gf;
-        let gen = &self.gen; // gen[0..=RS_2T], gen[RS_2T] = 1
+        assert_eq!(data.len(), self.k);
+        let gf    = &self.gf;
+        let gen   = &self.gen;
+        let two_t = self.two_t;
 
-        // Build dividend: m(x)·x^{2t}
-        // rem[0..RS_2T] = 0 (will become parity)
-        // rem[RS_2T..RS_N] = data
-        let mut rem = vec![0u8; RS_N];
-        rem[RS_2T..].copy_from_slice(data);
+        let mut rem = vec![0u8; self.n];
+        rem[two_t..].copy_from_slice(data);
 
-        // Polynomial long division by g(x) from the highest degree down.
-        // After each step, rem[i] = 0 for all i ≥ RS_2T.
-        for i in (RS_2T..RS_N).rev() {
+        for i in (two_t..self.n).rev() {
             if rem[i] == 0 { continue; }
-            let c = rem[i]; // leading coefficient (gen is monic: gen[RS_2T] = 1)
-            for j in 0..RS_2T {
-                rem[i - RS_2T + j] ^= gf.mul(c, gen[j]);
+            let c = rem[i];
+            for j in 0..two_t {
+                rem[i - two_t + j] ^= gf.mul(c, gen[j]);
             }
             rem[i] = 0;
         }
 
-        // Codeword = [parity, info]
-        let mut cw = rem[..RS_2T].to_vec();
+        let mut cw = rem[..two_t].to_vec();
         cw.extend_from_slice(data);
         cw
     }
 
     // ── Syndromes ─────────────────────────────────────────────────────────────
 
-    /// `S[j] = c(α^{j+1})` for j = 0…63.  All-zero ↔ no detectable error.
+    /// `S[j] = c(α^{j+1})` for j = 0…(two_t−1).  All-zero ↔ no detectable error.
     pub fn syndromes(&self, received: &[u8]) -> Vec<u8> {
-        assert_eq!(received.len(), RS_N);
-        (1..=RS_2T)
+        assert_eq!(received.len(), self.n);
+        (1..=self.two_t)
             .map(|j| self.gf.poly_eval(received, self.gf.alpha_pow(j)))
             .collect()
     }
@@ -184,17 +247,18 @@ impl RsCodec {
 
     /// Decodes a received codeword.
     ///
-    /// * `received`  — 255 bytes.
-    /// * `erasures`  — byte positions (0…254) that are known to be erased.
+    /// * `received`  — n bytes (255).
+    /// * `erasures`  — byte positions (0…n−1) that are known to be erased.
     ///
-    /// Returns 191 decoded information bytes plus correction statistics, or an [`RsError`].
+    /// Returns k decoded information bytes plus correction statistics, or an [`RsError`].
     pub fn decode(&self, received: &[u8], erasures: &[usize])
         -> Result<(Vec<u8>, RsDecodeStats), RsError>
     {
-        assert_eq!(received.len(), RS_N);
-        let f = erasures.len();
-        if f > RS_2T {
-            return Err(RsError::TooManyErasures { count: f, max: RS_2T });
+        assert_eq!(received.len(), self.n);
+        let f     = erasures.len();
+        let two_t = self.two_t;
+        if f > two_t {
+            return Err(RsError::TooManyErasures { count: f, max: two_t });
         }
 
         let gf = &self.gf;
@@ -202,11 +266,11 @@ impl RsCodec {
         // ── Syndromes ─────────────────────────────────────────────────────────
         let synd = self.syndromes(received);
         if synd.iter().all(|&s| s == 0) && f == 0 {
-            return Ok((received[RS_2T..].to_vec(),
+            return Ok((received[two_t..].to_vec(),
                        RsDecodeStats { errors_corrected: 0, erasures_used: 0 }));
         }
 
-        // ── Erasure locator Γ(x) = Π (1 − α^ρᵢ · x) ─────────────────────────
+        // ── Erasure locator Γ(x) ─────────────────────────────────────────────
         let mut gamma = vec![1u8];
         for &pos in erasures {
             let factor = vec![1u8, gf.alpha_pow(pos)];
@@ -214,40 +278,37 @@ impl RsCodec {
         }
 
         // ── Modified syndromes T(x) = S(x)·Γ(x) mod x^{2t} ──────────────────
-        // s_poly[i] = S[i]  (coefficient of xⁱ in the syndrome polynomial)
         let s_poly: Vec<u8> = synd.clone();
         let t_full = gf.poly_mul(&s_poly, &gamma);
-        let t_poly: Vec<u8> = t_full.iter().take(RS_2T).copied().collect();
+        let t_poly: Vec<u8> = t_full.iter().take(two_t).copied().collect();
 
-        // ── BM on the part of T beyond the erasure locator ────────────────────
-        let sigma = berlekamp_massey(gf, &t_poly[f.min(RS_2T)..]);
+        // ── Berlekamp-Massey ──────────────────────────────────────────────────
+        let sigma = berlekamp_massey(gf, &t_poly[f.min(two_t)..]);
 
-        let n_err = sigma.len().saturating_sub(1); // random errors (excl. erasures)
-        if 2 * n_err + f > RS_2T {
+        let n_err = sigma.len().saturating_sub(1);
+        if 2 * n_err + f > two_t {
             return Err(RsError::TooManyErrors { errors: n_err, erasures: f });
         }
 
         // ── Combined locator λ = σ · Γ ────────────────────────────────────────
         let lambda = gf.poly_mul(&sigma, &gamma);
 
-        // ── Chien search — roots of λ(x) ─────────────────────────────────────
-        let error_positions = chien_search(gf, &lambda);
+        // ── Chien search ──────────────────────────────────────────────────────
+        let error_positions = chien_search(gf, &lambda, self.n);
         if error_positions.len() != lambda.len().saturating_sub(1) {
             return Err(RsError::DecodingFailed("Chien: degree mismatch"));
         }
 
         // ── Error evaluator Ω(x) = S(x)·λ(x) mod x^{2t} ─────────────────────
         let omega_full = gf.poly_mul(&s_poly, &lambda);
-        let omega: Vec<u8> = omega_full.iter().take(RS_2T).copied().collect();
+        let omega: Vec<u8> = omega_full.iter().take(two_t).copied().collect();
 
-        // ── Forney — error/erasure magnitudes ─────────────────────────────────
-        // For generator roots at α¹…α^{2t} (b = 1):
-        //   eⱼ = Ω(Xⱼ⁻¹) / λ'(Xⱼ⁻¹)          (no extra Xⱼ factor)
-        let lambda_d = gf.poly_deriv(&lambda);
+        // ── Forney ────────────────────────────────────────────────────────────
+        let lambda_d  = gf.poly_deriv(&lambda);
         let mut corrected = received.to_vec();
 
         for &pos in &error_positions {
-            if pos >= RS_N {
+            if pos >= self.n {
                 return Err(RsError::DecodingFailed("error position out of range"));
             }
             let x_inv     = if pos == 0 { 1u8 } else { gf.alpha_pow(255 - pos) };
@@ -264,7 +325,7 @@ impl RsCodec {
             return Err(RsError::DecodingFailed("syndromes non-zero after correction"));
         }
 
-        Ok((corrected[RS_2T..].to_vec(),
+        Ok((corrected[two_t..].to_vec(),
             RsDecodeStats { errors_corrected: n_err, erasures_used: f }))
     }
 }
@@ -295,10 +356,10 @@ impl std::error::Error for RsError {}
 
 // ── Generator polynomial ──────────────────────────────────────────────────────
 
-/// g(x) = Π_{i=1}^{64} (x + αⁱ)  (monic, degree 64).
-fn build_generator(gf: &Gf256) -> Vec<u8> {
+/// g(x) = Π_{i=1}^{two_t} (x + αⁱ)  (monic, degree two_t).
+fn build_generator(gf: &Gf256, two_t: usize) -> Vec<u8> {
     let mut g = vec![1u8];
-    for i in 1..=RS_2T {
+    for i in 1..=two_t {
         let factor = vec![gf.alpha_pow(i), 1u8]; // αⁱ + x
         g = gf.poly_mul(&g, &factor);
     }
@@ -342,9 +403,9 @@ fn berlekamp_massey(gf: &Gf256, syndromes: &[u8]) -> Vec<u8> {
 
 // ── Chien search ─────────────────────────────────────────────────────────────
 
-/// Returns positions p ∈ [0, 254] where λ(α^{-p}) = 0.
-fn chien_search(gf: &Gf256, lam: &[u8]) -> Vec<usize> {
-    (0..RS_N).filter(|&pos| {
+/// Returns positions p ∈ [0, n−1] where λ(α^{-p}) = 0.
+fn chien_search(gf: &Gf256, lam: &[u8], n: usize) -> Vec<usize> {
+    (0..n).filter(|&pos| {
         let x_inv = if pos == 0 { 1u8 } else { gf.alpha_pow(255 - pos) };
         gf.poly_eval(lam, x_inv) == 0
     }).collect()
@@ -376,13 +437,26 @@ mod tests {
 
     #[test]
     fn generator_degree() {
-        let gf = Gf256::new(); assert_eq!(build_generator(&gf).len(), RS_2T + 1);
+        let gf = Gf256::new(); assert_eq!(build_generator(&gf, RS_2T).len(), RS_2T + 1);
     }
     #[test]
     fn generator_roots() {
         let gf  = Gf256::new();
-        let gen = build_generator(&gf);
+        let gen = build_generator(&gf, RS_2T);
         for i in 1..=RS_2T { assert_eq!(gf.poly_eval(&gen, gf.alpha_pow(i)), 0, "g(α^{i}) ≠ 0"); }
+    }
+    #[test]
+    fn rs_levels_roundtrip() {
+        for level in [RsLevel::L0, RsLevel::L1, RsLevel::L2] {
+            let rs   = RsCodec::for_level(level);
+            let data = vec![0x55u8; rs.k];
+            let cw   = rs.encode(&data);
+            assert_eq!(cw.len(), rs.n);
+            assert!(rs.syndromes(&cw).iter().all(|&s| s == 0));
+            let (dec, stats) = rs.decode(&cw, &[]).expect("no-error decode");
+            assert_eq!(dec, data);
+            assert_eq!(stats.errors_corrected, 0);
+        }
     }
 
     // ── Encode / syndromes ─────────────────────────────────────────────────────

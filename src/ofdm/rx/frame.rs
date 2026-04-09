@@ -57,7 +57,7 @@
 use num_complex::Complex32;
 
 use crate::fec::ldpc::{LdpcCode, LdpcDecoder};
-use crate::fec::rs::{RsCodec, RS_2T, RS_K, RS_N};
+use crate::fec::rs::{rs_interleave_m, RsCodec, RsLevel};
 use crate::ofdm::params::*;
 use crate::ofdm::rx::{
     demapper::demap,
@@ -67,11 +67,8 @@ use crate::ofdm::rx::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// LDPC codeword length (bits) — same for all four rates.
-const LDPC_N: usize = 252;
-
-/// RS codeword length in bits.
-const RS_CODEWORD_BITS: usize = RS_N * 8; // 255 × 8 = 2040
+/// LDPC codeword length (bits) — same for all four rates (z = 210).
+const LDPC_N: usize = 2520;
 
 /// Maximum OFDM data symbols per super-frame.
 ///
@@ -81,29 +78,44 @@ const RS_CODEWORD_BITS: usize = RS_N * 8; // 255 × 8 = 2040
 /// (half that), providing comfortable margin.
 pub const MAX_DATA_SYMS_PER_FRAME: usize = 1_400;
 
-// ── Helper: LDPC blocks per RS codeword ───────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Returns how many LDPC blocks (each carrying `k` info bits) are needed to
-/// carry exactly one RS codeword of [`RS_CODEWORD_BITS`] bits.
+/// Returns how many LDPC blocks are needed to carry `m` complete RS codewords
+/// of `rs_n` bytes each.
 ///
-/// The last block may carry fewer than `k` payload bits — the tail is padding.
-pub(crate) fn ldpc_blocks_per_rs(k: usize) -> usize {
-    (RS_CODEWORD_BITS + k - 1) / k
+/// The last block may be partially padded.
+pub(crate) fn blocks_per_rs_group(ldpc_k: usize, rs_n: usize, m: usize) -> usize {
+    (m * rs_n * 8).div_ceil(ldpc_k)
 }
 
-/// Maximum RS packets (each carrying [`RS_K`] payload bytes) that fit within
-/// [`MAX_DATA_SYMS_PER_FRAME`] OFDM data symbols for the given modulation and
-/// LDPC rate.
+/// Maximum RS packets that fit within [`MAX_DATA_SYMS_PER_FRAME`] OFDM data
+/// symbols for the given modulation, LDPC rate, and RS level.
 ///
-/// Both the TX (`build_transmission`) and RX (`FrameReceiver`) must use this
-/// function with identical arguments to agree on the per-frame packet boundary.
-pub fn max_packets_per_frame(modulation: Modulation, ldpc_rate: LdpcRate) -> usize {
-    let bps   = modulation.bits_per_symbol();
-    let code  = LdpcCode::for_rate(ldpc_rate);
-    let bpr   = ldpc_blocks_per_rs(code.k);
-    // OFDM data symbols needed for one RS packet (ceiling)
-    let syms  = (bpr * LDPC_N).div_ceil(NUM_DATA * bps);
-    (MAX_DATA_SYMS_PER_FRAME / syms).max(1)
+/// The result is always a multiple of the interleave factor M so that complete
+/// RS groups fill each super-frame.
+///
+/// Both the TX (`build_transmission`) and RX (`FrameReceiver`) must call this
+/// with identical arguments to agree on the per-frame packet boundary.
+pub fn max_packets_per_frame(
+    modulation: Modulation,
+    ldpc_rate:  LdpcRate,
+    rs_level:   RsLevel,
+) -> usize {
+    let bps        = modulation.bits_per_symbol();
+    let code       = LdpcCode::for_rate(ldpc_rate);
+    let (rs_n, _, rs_2t) = rs_level_params(rs_level);
+    let m          = rs_interleave_m(rs_2t, code.k);
+    let bpg        = blocks_per_rs_group(code.k, rs_n, m);
+    let syms       = (bpg * LDPC_N).div_ceil(NUM_DATA * bps);
+    let groups     = (MAX_DATA_SYMS_PER_FRAME / syms).max(1);
+    groups * m
+}
+
+/// Returns `(rs_n, rs_k, rs_2t)` for the given level (convenience alias).
+#[inline]
+pub(crate) fn rs_level_params(level: RsLevel) -> (usize, usize, usize) {
+    let (n, k, two_t) = level.params();
+    (n, k, two_t)
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -197,11 +209,22 @@ impl std::error::Error for FrameError {}
 /// [`push_symbol`]: FrameReceiver::push_symbol
 pub struct FrameReceiver {
     // ── Configuration ─────────────────────────────────────────────────────────
-    header:            ModeHeader,
-    ldpc_k:            usize,
-    blocks_per_rs:     usize,
-    total_ldpc_blocks: usize,
-    total_data_syms:   usize,
+    header:              ModeHeader,
+    ldpc_k:              usize,
+    /// RS codeword length (255 bytes).
+    rs_n:                usize,
+    /// RS info bytes per codeword.
+    rs_k:                usize,
+    /// RS parity bytes per codeword (2t).
+    rs_2t:               usize,
+    /// Number of RS codewords processed in parallel (interleave factor).
+    m_interleave:        usize,
+    /// LDPC blocks per RS group (= blocks needed for m_interleave RS codewords).
+    blocks_per_group:    usize,
+    total_ldpc_blocks:   usize,
+    total_data_syms:     usize,
+    /// RS packets actually in this frame (for capping rs_packets_ok).
+    packets_this_frame:  usize,
 
     // ── Processing units ──────────────────────────────────────────────────────
     equalizer: SymbolEqualizer,
@@ -209,41 +232,26 @@ pub struct FrameReceiver {
     rs:        RsCodec,
 
     // ── Accumulation buffers ──────────────────────────────────────────────────
-    /// Raw LLRs from the demapper, waiting for a complete LDPC block.
-    llr_buf: Vec<f32>,
-
-    /// LDPC info bits accumulated for the current RS packet.
-    /// Flushed into `rs_payload` after every `blocks_per_rs` LDPC blocks.
-    info_bits: Vec<u8>,
-
-    /// Decoded payload bytes (RS_K per successful RS packet, 0-filled otherwise).
+    llr_buf:    Vec<f32>,
+    info_bits:  Vec<u8>,
     rs_payload: Vec<u8>,
 
     // ── Symbol / block counters ────────────────────────────────────────────────
-    /// Total data symbols fed so far (re-sync ZC symbols not counted).
-    data_syms_received: usize,
-
-    /// Position within the current RESYNC_PERIOD group (reset at each re-sync ZC).
-    syms_in_group: usize,
-
-    /// Number of LDPC blocks decoded (across all RS packets).
+    data_syms_received:  usize,
+    syms_in_group:       usize,
     ldpc_blocks_decoded: usize,
-
-    /// RS packets that decoded successfully.
-    rs_packets_ok: u16,
+    rs_packets_ok:       u16,
 
     // ── SNR bookkeeping ────────────────────────────────────────────────────────
     pilot_snr_sum:   f32,
     pilot_snr_count: usize,
 
     // ── Metrics accumulation ───────────────────────────────────────────────────
-    /// Convergence flag for each decoded LDPC block (across all RS packets).
     ldpc_block_converged: Vec<bool>,
     channel_bit_errors:   u32,
     channel_bit_total:    u32,
     rs_errors_corrected:  u32,
     rs_erasures_used:     u32,
-    /// Running minimum of (RS_2T − 2·errors − erasures) / RS_2T.
     rs_min_margin_frac:   f32,
 }
 
@@ -254,33 +262,41 @@ impl FrameReceiver {
     /// * `channel_est` — [`NUM_CARRIERS`] complex channel coefficients from the ZC preamble.
     /// * `alpha`       — EMA tracking coefficient for the channel equalizer (0.05 … 0.3).
     pub fn new(header: &ModeHeader, channel_est: &[Complex32], alpha: f32) -> Self {
-        let code          = LdpcCode::for_rate(header.ldpc_rate);
-        let ldpc_k        = code.k;
-        let blocks_per_rs = ldpc_blocks_per_rs(ldpc_k);
+        let code             = LdpcCode::for_rate(header.ldpc_rate);
+        let ldpc_k           = code.k;
+        let (rs_n, rs_k, rs_2t) = rs_level_params(header.rs_level);
+        let m_interleave     = rs_interleave_m(rs_2t, ldpc_k);
+        let blocks_per_group = blocks_per_rs_group(ldpc_k, rs_n, m_interleave);
 
-        // How many RS packets are in THIS super-frame (capped by max_packets_per_frame)
+        // RS packets in THIS super-frame
         let remaining          = header.total_packet_count
                                     .saturating_sub(header.packet_offset) as usize;
-        let packets_this_frame = remaining
-                                    .min(max_packets_per_frame(header.modulation, header.ldpc_rate));
+        let packets_this_frame = remaining.min(
+            max_packets_per_frame(header.modulation, header.ldpc_rate, header.rs_level)
+        );
+        let groups_this_frame  = packets_this_frame.div_ceil(m_interleave);
 
-        let total_ldpc_blocks = packets_this_frame * blocks_per_rs;
-        let bits_per_ofdm    = NUM_DATA * header.modulation.bits_per_symbol();
-        let total_coded_bits = total_ldpc_blocks * LDPC_N;
-        // Ceiling division: may produce slightly more bits than needed (padding).
-        let total_data_syms  = (total_coded_bits + bits_per_ofdm - 1) / bits_per_ofdm;
+        let total_ldpc_blocks = groups_this_frame * blocks_per_group;
+        let bits_per_ofdm     = NUM_DATA * header.modulation.bits_per_symbol();
+        let total_coded_bits  = total_ldpc_blocks * LDPC_N;
+        let total_data_syms   = total_coded_bits.div_ceil(bits_per_ofdm);
 
         Self {
-            header:            header.clone(),
+            header:             header.clone(),
             ldpc_k,
-            blocks_per_rs,
+            rs_n,
+            rs_k,
+            rs_2t,
+            m_interleave,
+            blocks_per_group,
             total_ldpc_blocks,
             total_data_syms,
+            packets_this_frame,
             equalizer: SymbolEqualizer::from_preamble(channel_est, alpha),
             code,
-            rs:        RsCodec::new(),
-            llr_buf:   Vec::new(),
-            info_bits: Vec::new(),
+            rs:         RsCodec::for_level(header.rs_level),
+            llr_buf:    Vec::new(),
+            info_bits:  Vec::new(),
             rs_payload: Vec::new(),
             data_syms_received:  0,
             syms_in_group:       0,
@@ -409,71 +425,93 @@ impl FrameReceiver {
             }
             self.ldpc_blocks_decoded += 1;
 
-            // When a complete set of blocks covers one RS codeword, decode RS
-            if self.ldpc_blocks_decoded % self.blocks_per_rs == 0 {
-                self.decode_rs_packet();
+            // When blocks_per_group LDPC blocks complete, decode one RS group (M packets)
+            if self.ldpc_blocks_decoded % self.blocks_per_group == 0 {
+                self.decode_rs_group();
             }
         }
     }
 
-    // ── RS packet decoding ────────────────────────────────────────────────────
+    // ── RS group decoding (M codewords in parallel) ───────────────────────────
 
-    /// Packs `blocks_per_rs × ldpc_k` accumulated info bits into an RS codeword
-    /// and decodes it.  On success, appends RS_K payload bytes.  On failure,
-    /// appends RS_K zero bytes (erasure placeholder).
-    fn decode_rs_packet(&mut self) {
-        let total_info_bits = self.blocks_per_rs * self.ldpc_k;
-        debug_assert!(self.info_bits.len() >= total_info_bits);
+    /// Decodes one RS group: `blocks_per_group` LDPC blocks → `m_interleave` RS
+    /// codewords (byte-interleaved) → appends `m_interleave × rs_k` payload bytes.
+    ///
+    /// Erasures are distributed across codewords via the interleave mapping so
+    /// each LDPC block failure causes at most `⌈ldpc_k/(8·M)⌉` erasures per
+    /// RS codeword.
+    fn decode_rs_group(&mut self) {
+        let m         = self.m_interleave;
+        let rs_n      = self.rs_n;
+        let rs_k      = self.rs_k;
+        let rs_2t     = self.rs_2t;
+        let ldpc_k    = self.ldpc_k;
+        let total_bits = self.blocks_per_group * ldpc_k;
+        let total_bytes = m * rs_n; // flat interleaved byte stream length
 
-        // Drain all bits contributed by the last blocks_per_rs LDPC blocks
-        let bits: Vec<u8> = self.info_bits.drain(..total_info_bits).collect();
+        debug_assert!(self.info_bits.len() >= total_bits);
+        let bits: Vec<u8> = self.info_bits.drain(..total_bits).collect();
 
-        // Pack the first RS_CODEWORD_BITS bits into RS_N bytes (MSB first)
-        let mut codeword = [0u8; RS_N];
-        for (byte_idx, byte) in codeword.iter_mut().enumerate() {
+        // Convert bits → flat interleaved byte stream
+        let mut flat = vec![0u8; total_bytes];
+        for (byte_idx, byte) in flat.iter_mut().enumerate() {
             for bit_pos in 0..8usize {
                 let bit_idx = byte_idx * 8 + bit_pos;
-                if bit_idx < RS_CODEWORD_BITS && bit_idx < bits.len() && bits[bit_idx] != 0 {
+                if bit_idx < bits.len() && bits[bit_idx] != 0 {
                     *byte |= 1 << (7 - bit_pos);
                 }
             }
         }
 
-        // Compute RS erasure byte positions from LDPC blocks that did not converge
+        // Deinterleave: flat[b] → codeword[b % M][b / M]
+        let mut codewords: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; rs_n]).collect();
+        for (b, &byte) in flat.iter().enumerate() {
+            codewords[b % m][b / m] = byte;
+        }
+
+        // Compute erasure sets per RS codeword from failed LDPC blocks
         let blk_end   = self.ldpc_blocks_decoded;
-        let blk_start = blk_end - self.blocks_per_rs;
-        let mut erasure_set = std::collections::BTreeSet::new();
+        let blk_start = blk_end - self.blocks_per_group;
+        let mut erasure_sets: Vec<std::collections::BTreeSet<usize>> =
+            (0..m).map(|_| std::collections::BTreeSet::new()).collect();
+
         for (offset, &converged) in self.ldpc_block_converged[blk_start..blk_end].iter().enumerate() {
             if !converged {
-                let bit_start  = offset * self.ldpc_k;
-                let bit_end    = ((offset + 1) * self.ldpc_k).min(RS_CODEWORD_BITS);
-                let byte_start = bit_start / 8;
-                let byte_end   = (bit_end + 7) / 8;
-                for pos in byte_start..byte_end.min(RS_N) {
-                    erasure_set.insert(pos);
+                let b_start = offset * ldpc_k / 8;
+                let b_end   = ((offset + 1) * ldpc_k).div_ceil(8).min(total_bytes);
+                for b in b_start..b_end {
+                    let cw_idx   = b % m;
+                    let byte_pos = b / m;
+                    if byte_pos < rs_n {
+                        erasure_sets[cw_idx].insert(byte_pos);
+                    }
                 }
             }
         }
-        let erasures: Vec<usize> = erasure_set.into_iter().collect();
 
-        // RS decode with erasures from failed LDPC blocks
-        match self.rs.decode(&codeword, &erasures) {
-            Ok((info_bytes, stats)) => {
-                self.rs_payload.extend_from_slice(&info_bytes);
-                self.rs_packets_ok      += 1;
-                self.rs_errors_corrected += stats.errors_corrected as u32;
-                self.rs_erasures_used    += stats.erasures_used as u32;
-                // RS budget remaining: (RS_2T − 2·errors − erasures) / RS_2T
-                let budget_used = 2 * stats.errors_corrected + stats.erasures_used;
-                let margin = 1.0 - budget_used as f32 / RS_2T as f32;
-                if margin < self.rs_min_margin_frac {
-                    self.rs_min_margin_frac = margin;
+        // Decode each RS codeword; track which RS packets are "real" (vs padding)
+        let group_idx  = (self.ldpc_blocks_decoded - 1) / self.blocks_per_group;
+        let pkt_base   = group_idx * m;
+
+        for i in 0..m {
+            let is_real = pkt_base + i < self.packets_this_frame;
+            let era: Vec<usize> = erasure_sets[i].iter().copied().collect();
+
+            match self.rs.decode(&codewords[i], &era) {
+                Ok((info_bytes, stats)) => {
+                    self.rs_payload.extend_from_slice(&info_bytes);
+                    if is_real {
+                        self.rs_packets_ok       += 1;
+                        self.rs_errors_corrected += stats.errors_corrected as u32;
+                        self.rs_erasures_used    += stats.erasures_used as u32;
+                        let budget_used = 2 * stats.errors_corrected + stats.erasures_used;
+                        let margin = 1.0 - budget_used as f32 / rs_2t as f32;
+                        if margin < self.rs_min_margin_frac { self.rs_min_margin_frac = margin; }
+                    }
                 }
-            }
-            Err(_) => {
-                // RS failed: zero-fill so the payload slice remains aligned
-                self.rs_payload
-                    .extend(std::iter::repeat(0u8).take(RS_K));
+                Err(_) => {
+                    self.rs_payload.extend(std::iter::repeat(0u8).take(rs_k));
+                }
             }
         }
     }
@@ -485,10 +523,10 @@ impl FrameReceiver {
     /// The EOT symbol is always BPSK.  The CRC32 of the assembled payload is
     /// transmitted in the first 32 data subcarrier positions (MSB first).
     fn process_eot(&mut self, ofdm_symbol: &[Complex32]) -> PushResult {
-        // Safety flush: complete any pending LDPC block with zero-padding
+        // Safety flush: complete any partial LDPC blocks with zero-padding
         while self.ldpc_blocks_decoded < self.total_ldpc_blocks {
             while self.llr_buf.len() < LDPC_N {
-                self.llr_buf.push(0.0); // neutral LLR (50/50)
+                self.llr_buf.push(0.0);
             }
             self.drain_ldpc_blocks();
         }
@@ -571,23 +609,26 @@ pub struct TransmissionResult {
 
 /// Reassembles a multi-super-frame transmission from individual [`FrameResult`]s.
 ///
-/// Create with the `total_packet_count` from the first super-frame's header,
-/// then call [`push_frame`] for each decoded super-frame in order.
+/// Create with the `total_packet_count` and `rs_k` from the first super-frame's
+/// header, then call [`push_frame`] for each decoded super-frame in order.
 ///
 /// [`push_frame`]: TransmissionReceiver::push_frame
 pub struct TransmissionReceiver {
     total_packet_count: u16,
+    rs_k:               usize,
     payload:            Vec<u8>,
     packets_ok:         u16,
     all_crc32_ok:       bool,
 }
 
 impl TransmissionReceiver {
-    /// Creates a new receiver for a transmission of `total_packet_count` RS packets.
-    pub fn new(total_packet_count: u16) -> Self {
+    /// Creates a new receiver for a transmission of `total_packet_count` RS packets,
+    /// where each RS packet carries `rs_k` info bytes.
+    pub fn new(total_packet_count: u16, rs_k: usize) -> Self {
         Self {
             total_packet_count,
-            payload:      vec![0u8; total_packet_count as usize * RS_K],
+            rs_k,
+            payload:      vec![0u8; total_packet_count as usize * rs_k],
             packets_ok:   0,
             all_crc32_ok: true,
         }
@@ -597,14 +638,9 @@ impl TransmissionReceiver {
     pub fn is_all_crc_ok(&self) -> bool { self.all_crc32_ok }
 
     /// Adds one decoded super-frame.
-    ///
-    /// `result` is the [`FrameResult`] from [`FrameReceiver`]; `header` is the
-    /// decoded mode header for that super-frame.
-    ///
-    /// Returns [`TxPushResult::Complete`] when the last frame is received.
     pub fn push_frame(&mut self, result: FrameResult, header: &ModeHeader) -> TxPushResult {
-        // Place this frame's RS payload at the right byte offset.
-        let byte_offset = header.packet_offset as usize * RS_K;
+        let rs_k        = self.rs_k;
+        let byte_offset = header.packet_offset as usize * rs_k;
         let copy_len    = result.payload.len().min(
             self.payload.len().saturating_sub(byte_offset)
         );
@@ -615,12 +651,12 @@ impl TransmissionReceiver {
         self.packets_ok   += result.packets_ok;
         self.all_crc32_ok &= result.crc32_ok;
 
-        // Is this the last frame?
-        let remaining          = self.total_packet_count
-                                    .saturating_sub(header.packet_offset) as usize;
-        let packets_this_frame = remaining
-                                    .min(max_packets_per_frame(header.modulation, header.ldpc_rate));
-        let next_offset        = header.packet_offset as usize + packets_this_frame;
+        let remaining = self.total_packet_count
+                            .saturating_sub(header.packet_offset) as usize;
+        let packets_this_frame = remaining.min(
+            max_packets_per_frame(header.modulation, header.ldpc_rate, header.rs_level)
+        );
+        let next_offset = header.packet_offset as usize + packets_this_frame;
 
         if next_offset >= self.total_packet_count as usize {
             TxPushResult::Complete(TransmissionResult {
@@ -659,12 +695,15 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ofdm::{
-        rx::{
-            mode_detect::{LdpcRate, ModeHeader, Modulation},
-            sync::channel_estimate_from_zc,
+    use crate::{
+        fec::rs::RsLevel,
+        ofdm::{
+            rx::{
+                mode_detect::{LdpcRate, ModeHeader, Modulation},
+                sync::channel_estimate_from_zc,
+            },
+            zc::build_preamble,
         },
-        zc::build_preamble,
     };
     use rustfft::FftPlanner;
 
@@ -723,41 +762,49 @@ mod tests {
     // ── Unit tests ────────────────────────────────────────────────────────────
 
     #[test]
-    fn ldpc_blocks_per_rs_sensible() {
+    fn blocks_per_rs_group_sensible() {
         for &rate in &[LdpcRate::R1_2, LdpcRate::R2_3, LdpcRate::R3_4, LdpcRate::R5_6] {
-            let code = LdpcCode::for_rate(rate);
-            let b    = ldpc_blocks_per_rs(code.k);
-            assert!(b >= 1, "must need at least 1 LDPC block per RS codeword");
-            let carried = b * code.k;
-            assert!(carried >= RS_CODEWORD_BITS,
-                "rate {rate}: {b} blocks × k={} = {carried} bits < {RS_CODEWORD_BITS}",
-                code.k);
-            // The excess (padding) must be less than one full LDPC block
-            assert!(carried - RS_CODEWORD_BITS < code.k,
-                "rate {rate}: excess {excess} >= k={k}",
-                excess = carried - RS_CODEWORD_BITS, k = code.k);
+            for &level in &[RsLevel::L0, RsLevel::L1, RsLevel::L2] {
+                let code  = LdpcCode::for_rate(rate);
+                let (rs_n, _, rs_2t) = level.params();
+                let m     = rs_interleave_m(rs_2t, code.k);
+                let bpg   = blocks_per_rs_group(code.k, rs_n, m);
+                assert!(bpg >= 1, "rate={rate:?} level={level}: need ≥1 block");
+                let carried = bpg * code.k;
+                let needed  = m * rs_n * 8;
+                assert!(carried >= needed,
+                    "rate={rate:?} level={level}: {bpg}×k={} = {carried} < {needed}",
+                    code.k);
+                // Waste must be < one full LDPC block
+                assert!(carried - needed < code.k,
+                    "rate={rate:?} level={level}: waste {} ≥ k={}",
+                    carried - needed, code.k);
+            }
         }
     }
 
     #[test]
     fn expected_symbol_count_no_resync() {
         let header = ModeHeader {
-            modulation:         Modulation::Qam16,   // 4 bps → 252 bits/symbol
-            ldpc_rate:          LdpcRate::R3_4,      // k=189, blocks_per_rs=11
+            modulation:         Modulation::Qam16,
+            ldpc_rate:          LdpcRate::R3_4,
+            rs_level:           RsLevel::L1,
             has_resync:         false,
             total_packet_count: 1,
             packet_offset:      0,
             crc_ok:             true,
         };
         let code = LdpcCode::for_rate(header.ldpc_rate);
+        let (rs_n, _, rs_2t) = header.rs_level.params();
+        let m   = rs_interleave_m(rs_2t, code.k);
+        let bpg = blocks_per_rs_group(code.k, rs_n, m);
+        // 1 RS packet → ceil(1/M)=1 group → bpg blocks → OFDM symbols
+        let groups = 1usize.div_ceil(m);
+        let total_coded   = groups * bpg * LDPC_N;
+        let bits_per_ofdm = NUM_DATA * 4;
+        let expected_data = total_coded.div_ceil(bits_per_ofdm);
         let h_est = flat_channel_est();
         let rx = FrameReceiver::new(&header, &h_est, 0.1);
-
-        // 1 RS packet × 11 LDPC blocks × 252 bits / (63 × 4 bps) = 11 sym → +1 EOT
-        let blocks_per_rs = ldpc_blocks_per_rs(code.k);
-        let total_coded   = 1 * blocks_per_rs * LDPC_N;
-        let bits_per_ofdm = NUM_DATA * 4;
-        let expected_data = (total_coded + bits_per_ofdm - 1) / bits_per_ofdm;
         assert_eq!(rx.total_data_syms, expected_data);
         assert_eq!(rx.expected_symbol_count(), expected_data + 1);
     }
@@ -766,7 +813,8 @@ mod tests {
     fn expected_symbol_count_with_resync() {
         let header = ModeHeader {
             modulation:         Modulation::Bpsk,
-            ldpc_rate:          LdpcRate::R1_2,  // k=126, blocks_per_rs=17
+            ldpc_rate:          LdpcRate::R1_2,
+            rs_level:           RsLevel::L1,
             has_resync:         true,
             total_packet_count: 1,
             packet_offset:      0,
@@ -786,44 +834,49 @@ mod tests {
 
     /// Full loopback on a flat noiseless channel using the all-zero payload.
     ///
-    /// All-zero payload → all-zero RS codeword (valid) → all-zero LDPC info bits
+    /// All-zero payload → all-zero RS codewords (valid) → all-zero LDPC info bits
     /// → all-zero LDPC codeword (the zero vector satisfies every parity check).
     /// The BPSK channel maps 0 → +1, recovered with very high LLR → BP converges
     /// to all-zeros immediately → RS decodes → CRC32 matches.
+    ///
+    /// With z=210: k_R1/2 = 1260, M = rs_interleave_m(64, 1260) = 3,
+    /// blocks_per_group = ceil(3×255×8 / 1260) = 5 → 5×2520 = 12600 coded bits.
     #[test]
     fn loopback_bpsk_r12_one_packet() {
-        use crate::fec::ldpc::LdpcCode;
-
         let ldpc_rate  = LdpcRate::R1_2;
         let modulation = Modulation::Bpsk;
+        let rs_level   = RsLevel::L1;
         let bps        = modulation.bits_per_symbol(); // 1
 
         let code = LdpcCode::for_rate(ldpc_rate);
-        let k    = code.k;  // 126
-        let bpr  = ldpc_blocks_per_rs(k); // ⌈2040/126⌉ = 17
+        let k    = code.k; // 1260 (z=210, R1/2)
+        let (rs_n, rs_k, rs_2t) = rs_level.params(); // (255, 191, 64)
+        let m    = rs_interleave_m(rs_2t, k);               // 3
+        let bpg  = blocks_per_rs_group(k, rs_n, m);         // 5
 
-        // All-zero payload: RS encode of zeros = all-zero codeword.
-        let payload = vec![0u8; RS_K];
-
-        // All-zero RS codeword bits → all-zero LDPC blocks (zero is always a
-        // valid LDPC codeword — every parity check sums to 0 over GF(2)).
-        let all_coded_bits = vec![0u8; bpr * LDPC_N];
-        assert_eq!(all_coded_bits.len(), bpr * LDPC_N);
+        // 1 real RS packet → 1 group (ceil(1/M) = 1).
+        // The group carries M=3 RS codewords; only the first is "real".
+        // All-zero payload → all-zero RS codewords → all-zero LDPC info bits
+        // → all-zero LDPC codewords (zero satisfies every parity check).
+        let total_coded_bits = bpg * LDPC_N; // 5 × 2520 = 12600
 
         // ── Build OFDM symbols ────────────────────────────────────────────────
-        let bits_per_ofdm = NUM_DATA * bps;
-        let total_data_syms = (all_coded_bits.len() + bits_per_ofdm - 1) / bits_per_ofdm;
+        let bits_per_ofdm = NUM_DATA * bps; // 63
+        let total_data_syms = total_coded_bits.div_ceil(bits_per_ofdm); // 200
 
+        let all_coded_bits = vec![0u8; total_coded_bits];
         let mut ofdm_syms: Vec<Vec<Complex32>> = Vec::new();
         for sym_idx in 0..total_data_syms {
-            let start = sym_idx * bits_per_ofdm;
-            let end   = (start + bits_per_ofdm).min(all_coded_bits.len());
+            let start    = sym_idx * bits_per_ofdm;
+            let end      = (start + bits_per_ofdm).min(all_coded_bits.len());
             let sym_bits = &all_coded_bits[start..end];
             ofdm_syms.push(bits_to_ofdm_symbol(sym_bits, bps));
         }
 
-        // EOT symbol: CRC32 of payload in first 32 data subcarriers
-        let crc = crc32_ieee(&payload);
+        // EOT CRC32: computed over the full rs_payload that FrameReceiver
+        // assembles — M × rs_k bytes (3×191=573 zero bytes for the all-zero case).
+        let rs_payload_bytes = m * rs_k; // 573
+        let crc = crc32_ieee(&vec![0u8; rs_payload_bytes]);
         let mut eot_bits = vec![0u8; NUM_DATA];
         for i in 0..32 {
             eot_bits[i] = ((crc >> (31 - i)) & 1) as u8;
@@ -834,6 +887,7 @@ mod tests {
         let header = ModeHeader {
             modulation,
             ldpc_rate,
+            rs_level,
             has_resync:         false,
             total_packet_count: 1,
             packet_offset:      0,
@@ -841,6 +895,9 @@ mod tests {
         };
         let h_est = flat_channel_est();
         let mut rx = FrameReceiver::new(&header, &h_est, 0.1);
+
+        assert_eq!(rx.total_data_syms, total_data_syms,
+            "FrameReceiver and test disagree on data symbol count");
 
         let mut result = None;
         for sym in &ofdm_syms {
@@ -853,8 +910,9 @@ mod tests {
 
         let frame = result.expect("FrameReceiver should have returned FrameComplete");
         assert!(frame.crc32_ok, "EOT CRC32 must pass on noiseless loopback");
-        assert_eq!(frame.packets_ok, 1, "RS packet must decode successfully");
-        assert_eq!(&frame.payload[..RS_K], &payload[..],
+        assert_eq!(frame.packets_ok, 1, "only the real RS packet counts");
+        // The first rs_k bytes of the payload are the decoded real packet (zeros).
+        assert_eq!(&frame.payload[..rs_k], &vec![0u8; rs_k][..],
             "decoded payload must match original");
     }
 }
