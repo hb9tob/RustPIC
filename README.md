@@ -17,7 +17,7 @@ Image → WebP encode → payload bytes
      RS(255,k) outer FEC   3 selectable protection levels (L0/L1/L2)
            │  M-way byte interleave
            ▼
-     LDPC (1/2…5/6)        inner FEC — adaptive rate per link SNR, z=210 (n=2520)
+     LDPC (1/2…5/6)        inner FEC — adaptive rate per link SNR, IEEE 802.11n z=81 (n=1944)
            │
            ▼
      OFDM modulator        FFT=256, CP=32, fs=8 kHz, 72 subcarriers (312–2531 Hz)
@@ -47,16 +47,17 @@ Large payloads are split across multiple super-frames. The mode header carries a
 
 ### FEC
 
-#### Inner — LDPC (z = 210, n = 2520)
+#### Inner — LDPC (IEEE 802.11n, z = 81, n = 1944)
 
 | Rate | k (info bits) | Code rate |
 |------|--------------|-----------|
-| 1/2  | 1 260        | 0.500     |
-| 2/3  | 1 680        | 0.667     |
-| 3/4  | 1 890        | 0.750     |
-| 5/6  | 2 100        | 0.833     |
+| 1/2  | 972          | 0.500     |
+| 2/3  | 1 296        | 0.667     |
+| 3/4  | 1 458        | 0.750     |
+| 5/6  | 1 620        | 0.833     |
 
-QC-LDPC with quasi-cyclic shift z=210, scaled min-sum BP decoder (50 iterations, α=0.75).
+QC-LDPC based on IEEE 802.11n-2009 Annex R (z=81, n_b=24, PEG-optimised shifts).
+Scaled min-sum BP decoder (50 iterations, α=0.75).
 Failed LDPC blocks are forwarded to the RS layer as erasures.
 
 #### Outer — Reed–Solomon, 3 selectable levels
@@ -83,13 +84,13 @@ within the RS budget.  M is derived automatically for every rate/level pair.
 
 ### Packets per super-frame (RS level L1)
 
-| Modulation | LDPC rate | Pkts/frame | Payload/frame |
-|------------|-----------|-----------|---------------|
-| BPSK       | R1/2      | 21        | ~4 KB         |
-| QPSK       | R2/3      | 56        | ~10 KB        |
-| 16-QAM     | R3/4      | 112       | ~20 KB        |
-| 64-QAM     | R3/4      | 164       | ~30 KB        |
-| 64-QAM     | R5/6      | 205       | ~38 KB        |
+| Modulation | LDPC rate | M | bpg | Pkts/frame | Payload/frame |
+|------------|-----------|---|-----|-----------|---------------|
+| BPSK       | R1/2      | 2 | 5   | 18        | ~3.4 KB       |
+| QPSK       | R2/3      | 3 | 5   | 51        | ~9.7 KB       |
+| 16-QAM     | R3/4      | 3 | 5   | 105       | ~20 KB        |
+| 64-QAM     | R3/4      | 3 | 5   | 159       | ~30 KB        |
+| 64-QAM     | R5/6      | 4 | 6   | 180       | ~34 KB        |
 
 ---
 
@@ -161,19 +162,19 @@ Example — 64-QAM R3/4 RS-L1, 100 KB payload, ±10 ppm clock offset, resync ena
 ```
 $ cargo run --release --bin simtest -- \
     --mod 64qam --rate 3/4 --rs-level 1 --payload-size 100000 \
-    --snr-min 18 --snr-max 26 --snr-step 1 --ppm 10 --runs 30 --resync
+    --snr-min 14 --snr-max 22 --snr-step 1 --ppm 10 --runs 20 --resync
 
  SNR(dB)   ch.BER%   LDPC_ok%  LDPC_fail%   RS_ok%  RS_fail%   RS_margin%  CRC32_ok%
 ------------------------------------------------------------------------------------
-    18.0      0.51       77.6        22.4     69.5      30.5          0.7        0.0
-    19.0      0.29       89.1        10.9     88.4      11.6          1.9        0.0
-    20.0      0.14       95.7         4.3     97.0       3.0          4.1       13.3
-    21.0      0.06       98.5         1.5     99.4       0.6          5.8       83.3
-    22.0      0.03       99.3         0.7     99.8       0.2         12.4       83.3
-    23.0      0.01       99.7         0.3    100.0       0.0         43.8       96.7
-    24.0      0.01       99.8         0.2    100.0       0.0         40.7      100.0
-    25.0      0.00       99.9         0.1    100.0       0.0         78.1      100.0
-    26.0      0.00      100.0         0.0    100.0       0.0         94.8      100.0
+    14.0      3.42       91.0         9.0     88.3      11.7          9.5       35.0
+    15.0      2.70       95.3         4.7     93.6       6.4         36.2       40.0
+    16.0      1.59       99.7         0.3     99.8       0.2         75.2       85.0
+    17.0      0.97       99.9         0.1    100.0       0.0         94.3       95.0
+    18.0      0.57      100.0         0.0    100.0       0.0         99.1      100.0
+    19.0      0.27      100.0         0.0    100.0       0.0        100.0      100.0
+    20.0      0.15      100.0         0.0    100.0       0.0        100.0      100.0
+    21.0      0.00      100.0         0.0    100.0       0.0        100.0      100.0
+    22.0      0.00      100.0         0.0    100.0       0.0        100.0      100.0
 ```
 
 ---
