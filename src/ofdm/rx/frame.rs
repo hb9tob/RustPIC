@@ -67,8 +67,8 @@ use crate::ofdm::rx::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// LDPC codeword length (bits) — same for all four rates (z = 210).
-const LDPC_N: usize = 2520;
+/// LDPC codeword length (bits) — same for all four rates (IEEE 802.11n, z = 81).
+const LDPC_N: usize = 1944;
 
 /// Maximum OFDM data symbols per super-frame.
 ///
@@ -839,8 +839,8 @@ mod tests {
     /// The BPSK channel maps 0 → +1, recovered with very high LLR → BP converges
     /// to all-zeros immediately → RS decodes → CRC32 matches.
     ///
-    /// With z=210: k_R1/2 = 1260, M = rs_interleave_m(64, 1260) = 3,
-    /// blocks_per_group = ceil(3×255×8 / 1260) = 5 → 5×2520 = 12600 coded bits.
+    /// 802.11n z=81, R1/2: k=972, M=rs_interleave_m(64,972)=2,
+    /// bpg=blocks_per_rs_group(972,255,2)=5 → 5×1944=9720 coded bits → 155 OFDM syms.
     #[test]
     fn loopback_bpsk_r12_one_packet() {
         let ldpc_rate  = LdpcRate::R1_2;
@@ -849,20 +849,20 @@ mod tests {
         let bps        = modulation.bits_per_symbol(); // 1
 
         let code = LdpcCode::for_rate(ldpc_rate);
-        let k    = code.k; // 1260 (z=210, R1/2)
+        let k    = code.k; // 972 (802.11n z=81, R1/2)
         let (rs_n, rs_k, rs_2t) = rs_level.params(); // (255, 191, 64)
-        let m    = rs_interleave_m(rs_2t, k);               // 3
-        let bpg  = blocks_per_rs_group(k, rs_n, m);         // 5
+        let m    = rs_interleave_m(rs_2t, k);         // 2
+        let bpg  = blocks_per_rs_group(k, rs_n, m);   // 5
 
         // 1 real RS packet → 1 group (ceil(1/M) = 1).
-        // The group carries M=3 RS codewords; only the first is "real".
+        // The group carries M=2 RS codewords; only the first is "real".
         // All-zero payload → all-zero RS codewords → all-zero LDPC info bits
         // → all-zero LDPC codewords (zero satisfies every parity check).
-        let total_coded_bits = bpg * LDPC_N; // 5 × 2520 = 12600
+        let total_coded_bits = bpg * LDPC_N; // 5 × 1944 = 9720
 
         // ── Build OFDM symbols ────────────────────────────────────────────────
         let bits_per_ofdm = NUM_DATA * bps; // 63
-        let total_data_syms = total_coded_bits.div_ceil(bits_per_ofdm); // 200
+        let total_data_syms = total_coded_bits.div_ceil(bits_per_ofdm); // 155
 
         let all_coded_bits = vec![0u8; total_coded_bits];
         let mut ofdm_syms: Vec<Vec<Complex32>> = Vec::new();
@@ -874,8 +874,8 @@ mod tests {
         }
 
         // EOT CRC32: computed over the full rs_payload that FrameReceiver
-        // assembles — M × rs_k bytes (3×191=573 zero bytes for the all-zero case).
-        let rs_payload_bytes = m * rs_k; // 573
+        // assembles — M × rs_k bytes (2×191=382 zero bytes for the all-zero case).
+        let rs_payload_bytes = m * rs_k; // 382
         let crc = crc32_ieee(&vec![0u8; rs_payload_bytes]);
         let mut eot_bits = vec![0u8; NUM_DATA];
         for i in 0..32 {
