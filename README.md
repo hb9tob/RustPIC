@@ -197,10 +197,53 @@ $ cargo run --release --bin simtest -- \
 
 ---
 
+## TX/RX command-line tools
+
+### Transmitter — `tx`
+
+```bash
+cargo run --release --bin tx -- --input <file> --output <out.wav> [OPTIONS]
+```
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `--mod` | `bpsk` `qpsk` `16qam` `32qam` `64qam` | `qpsk` |
+| `--rate` | `1/2` `2/3` `3/4` `5/6` | `3/4` |
+| `--rs` | `0` `1` `2` | `1` (L1) |
+| `--resync` | flag | off |
+
+The output WAV is 48 kHz 16-bit stereo.  The filename of `--input` is embedded in the
+payload so the receiver can restore it without any metadata on the command line.
+
+### Receiver — `rx`
+
+```bash
+cargo run --release --bin rx -- --input <file.wav> [--outdir <dir>]
+```
+
+The receiver scans the **entire** WAV for RustPIC preambles and decodes every
+transmission it finds, writing each file to `--outdir` (default: `.`) under its
+original filename.  Multiple transmissions in sequence — separated by silence,
+speech, or noise — are all decoded in one pass.  Progress is shown on stderr.
+
+### Audio pipeline
+
+| Direction | Operation | Details |
+|-----------|-----------|---------|
+| TX 8→48 kHz | Nearest-neighbour upsample | Repeat × 6; no phase distortion |
+| RX 48→8 kHz | 13-tap Hamming-windowed sinc LPF | fc = 4 kHz, group delay = 1 sample @ 8 kHz |
+
+The TX/RX round-trip is mathematically exact in loopback (nearest-neighbour × box-
+average = identity).  For real soundcard input the FIR provides >40 dB stopband
+attenuation above 4 kHz, preventing speech/noise aliases from contaminating the
+OFDM band (312–2531 Hz).
+
+---
+
 ## Status
 
 Work in progress. The full codec stack (TX + RX + simulation) is implemented and tested.
-Audio I/O, image encode/decode, Hamlib integration, and the web interface are not yet wired up.
+Image encode/decode, Hamlib integration, and the web interface are not yet wired up.
 
 ---
 

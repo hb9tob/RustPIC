@@ -22,3 +22,11 @@ rand        = "0.8"
 
 [dev-dependencies]
 approx = "0.5"
+
+[[bin]]
+name = "tx"
+path = "src/bin/tx.rs"
+
+[[bin]]
+name = "rx"
+path = "src/bin/rx.rs"

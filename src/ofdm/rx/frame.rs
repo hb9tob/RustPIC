@@ -637,6 +637,9 @@ impl TransmissionReceiver {
     /// Returns `true` if every super-frame pushed so far passed its CRC32 check.
     pub fn is_all_crc_ok(&self) -> bool { self.all_crc32_ok }
 
+    /// Number of RS packets successfully decoded so far.
+    pub fn packets_received(&self) -> u16 { self.packets_ok }
+
     /// Adds one decoded super-frame.
     pub fn push_frame(&mut self, result: FrameResult, header: &ModeHeader) -> TxPushResult {
         let rs_k        = self.rs_k;
