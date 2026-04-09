@@ -62,15 +62,19 @@ Failed LDPC blocks are forwarded to the RS layer as erasures.
 
 #### Outer — Reed–Solomon, 3 selectable levels
 
-| Level | RS params   | Parity (2t) | Erasure capacity | Throughput |
-|-------|-------------|-------------|------------------|------------|
-| L0    | RS(255,239) | 16 bytes    | 16 erasures      | high       |
-| L1    | RS(255,191) | 64 bytes    | 64 erasures      | balanced (default) |
-| L2    | RS(255,127) | 128 bytes   | 128 erasures     | strong FEC |
+| Level | RS params   | rs_k | Parity (2t) | Max payload (4095 pkts) |
+|-------|-------------|------|-------------|------------------------|
+| L0    | RS(255,239) | 239  | 16 bytes    | ~956 KB                |
+| L1    | RS(255,191) | 191  | 64 bytes    | ~764 KB  *(default)*   |
+| L2    | RS(255,127) | 127  | 128 bytes   | ~508 KB                |
 
 RS codewords are **M-way byte-interleaved**: a single failed LDPC block spreads its
 `⌈k/8⌉` affected bytes across M RS codewords, keeping the per-codeword erasure count
 within the RS budget.  M is derived automatically for every rate/level pair.
+
+For all RS levels and LDPC rates, the interleave depth M is chosen so that **1 failed LDPC
+block per RS group** is correctable.  With bpg=5 this means 20% of LDPC blocks per group
+can be declared failed and still recovered; bpg=6 (R5/6 L1) allows 16.7%.
 
 ### Modulations
 
@@ -91,6 +95,20 @@ within the RS budget.  M is derived automatically for every rate/level pair.
 | 16-QAM     | R3/4      | 3 | 5   | 105       | ~20 KB        |
 | 64-QAM     | R3/4      | 3 | 5   | 159       | ~30 KB        |
 | 64-QAM     | R5/6      | 4 | 6   | 180       | ~34 KB        |
+
+### Net payload throughput (asymptotic, per RS level)
+
+| Modulation | LDPC rate | L0       | L1       | L2      |
+|------------|-----------|----------|----------|---------|
+| BPSK       | R1/2      | ~101 B/s | ~68 B/s  | ~38 B/s |
+| QPSK       | R2/3      | ~263 B/s | ~204 B/s | ~114 B/s|
+| 16-QAM     | R3/4      | ~604 B/s | ~408 B/s | ~294 B/s|
+| 32-QAM     | R3/4      | ~759 B/s | ~513 B/s | ~371 B/s|
+| 64-QAM     | R3/4      | ~905 B/s | ~612 B/s | ~441 B/s|
+| 64-QAM     | R5/6      | ~981 B/s | ~685 B/s | ~441 B/s|
+
+Time to transmit 100 KB with 64-QAM: ~1.7 min (L0 R5/6) · ~2.4 min (L1 R5/6) · ~3.8 min (L2 R3/4).
+Time with BPSK R1/2: ~16.5 min (L0) · ~24 min (L1) · ~44 min (L2).
 
 ---
 
