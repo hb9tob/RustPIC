@@ -6,9 +6,9 @@ on:
       - 'v*'
 
 jobs:
-  build:
+  build-windows:
+    name: Windows (x86_64)
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -20,28 +20,84 @@ jobs:
       - name: Install MinGW cross-compiler
         run: sudo apt-get install -y gcc-mingw-w64-x86-64
 
-      - name: Build Windows binaries
+      - name: Build
         run: cargo build --release --target x86_64-pc-windows-gnu --bin tx --bin rx
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            target/x86_64-pc-windows-gnu/release/tx.exe
+            target/x86_64-pc-windows-gnu/release/rx.exe
+
+  build-linux:
+    name: Linux (x86_64 static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl --bin tx --bin rx
+
+      - name: Rename binaries
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/tx tx-linux-x86_64
+          cp target/x86_64-unknown-linux-musl/release/rx rx-linux-x86_64
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            tx-linux-x86_64
+            rx-linux-x86_64
+
+  release:
+    name: Create Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/x86_64-pc-windows-gnu/release/tx.exe
-            target/x86_64-pc-windows-gnu/release/rx.exe
+            windows-x86_64/tx.exe
+            windows-x86_64/rx.exe
+            linux-x86_64/tx-linux-x86_64
+            linux-x86_64/rx-linux-x86_64
           body: |
             ## RustPIC ${{ github.ref_name }}
 
+            Binaires autonomes — aucune installation requise.
+
+            | Fichier | Plateforme |
+            |---------|-----------|
+            | `tx.exe` / `rx.exe` | Windows 64-bit |
+            | `tx-linux-x86_64` / `rx-linux-x86_64` | Linux 64-bit (statique, musl) |
+
             ### Utilisation
 
-            **Encoder un fichier en WAV :**
+            **Encoder un fichier en WAV (obligatoire: indicatif) :**
             ```
-            tx.exe --input photo.jpg --output photo.wav --mod 16qam --rate 3/4
-            ```
-
-            **Décoder un WAV (tous les fichiers présents) :**
-            ```
-            rx.exe --input enregistrement.wav --outdir .
+            tx --input photo.jpg --output photo.wav --callsign HB9TOB --mod 16qam --rate 3/4
             ```
 
-            Les deux exécutables sont autonomes, aucune installation requise.
+            **Décoder un WAV — tous les fichiers trouvés sont extraits :**
+            ```
+            rx --input enregistrement.wav --outdir .
+            ```
+
+            Le beacon de 612 ms en début de transmission active le VOX et transmet
+            l'indicatif, le nom de fichier et le mode avant les données.
