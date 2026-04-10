@@ -10,6 +10,7 @@ use num_complex::Complex32;
 
 use rustpic::{
     ofdm::{
+        beacon::{try_decode_beacon, BEACON_ANN_SYMS, BEACON_SKIP_TO_DATA},
         params::{CP_LEN, RESYNC_PERIOD, SYMBOL_LEN},
         rx::{
             frame::{
@@ -154,8 +155,21 @@ fn main() {
         let hdr_win = &buf[hdr_rel + CP_LEN..hdr_rel + SYMBOL_LEN];
         let header  = match decode_mode_header(hdr_win, &sync.channel_est) {
             Ok(h)  => h,
-            Err(e) => {
-                eprintln!("  [frame {}] header decode error: {e}", frame_stats.len());
+            Err(_) => {
+                // Check if this is a beacon frame (ANN symbols after ZC pair).
+                let ann_start = hdr_rel; // same offset as the mode header
+                let ann_end   = ann_start + BEACON_ANN_SYMS * SYMBOL_LEN;
+                if ann_end <= buf.len() {
+                    if let Some(info) = try_decode_beacon(
+                        &buf[ann_start..ann_end], &sync.channel_est)
+                    {
+                        eprint!("\r{:50}\r", ""); // clear progress line
+                        eprintln!("  Beacon    : {}", info.text);
+                        // Jump past the beacon ANN symbols to where the data ZC starts.
+                        search_start = abs_preamble + BEACON_SKIP_TO_DATA * SYMBOL_LEN;
+                        continue;
+                    }
+                }
                 search_start += SYMBOL_LEN;
                 continue;
             }

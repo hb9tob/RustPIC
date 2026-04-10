@@ -15,6 +15,7 @@ use std::io::Write as IoWrite;
 use rustpic::{
     fec::rs::RsLevel,
     ofdm::{
+        beacon::build_beacon,
         rx::{
             frame::max_packets_per_frame,
             mode_detect::{LdpcRate, Modulation},
@@ -34,6 +35,7 @@ const UP_FACTOR: usize = (FS_OUT / FS_BASE) as usize; // 6
 struct Cfg {
     input:      String,
     output:     String,
+    callsign:   String,
     modulation: Modulation,
     ldpc_rate:  LdpcRate,
     rs_level:   RsLevel,
@@ -45,6 +47,7 @@ impl Default for Cfg {
         Self {
             input:      String::new(),
             output:     String::new(),
+            callsign:   String::new(),
             modulation: Modulation::Qpsk,
             ldpc_rate:  LdpcRate::R3_4,
             rs_level:   RsLevel::L1,
@@ -59,9 +62,10 @@ fn parse_args() -> Cfg {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--input"  => { i += 1; cfg.input  = args[i].clone(); }
-            "--output" => { i += 1; cfg.output = args[i].clone(); }
-            "--resync" => { cfg.resync = true; }
+            "--input"     => { i += 1; cfg.input    = args[i].clone(); }
+            "--output"    => { i += 1; cfg.output   = args[i].clone(); }
+            "--callsign"  => { i += 1; cfg.callsign = args[i].to_uppercase(); }
+            "--resync"    => { cfg.resync = true; }
             "--mod"  => {
                 i += 1;
                 cfg.modulation = match args[i].as_str() {
@@ -97,19 +101,21 @@ fn parse_args() -> Cfg {
         }
         i += 1;
     }
-    if cfg.input.is_empty()  { die("--input is required"); }
-    if cfg.output.is_empty() { die("--output is required"); }
+    if cfg.input.is_empty()    { die("--input is required"); }
+    if cfg.output.is_empty()   { die("--output is required"); }
+    if cfg.callsign.is_empty() { die("--callsign is required"); }
     cfg
 }
 
 fn print_help() {
     println!("RustPIC TX — encode a file into a 48 kHz 16-bit stereo WAV");
     println!();
-    println!("USAGE: tx --input <file> --output <out.wav> [OPTIONS]");
+    println!("USAGE: tx --input <file> --output <out.wav> --callsign <CALL> [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("  --input  <file>      File to transmit (required)");
-    println!("  --output <out.wav>   Output WAV file  (required)");
+    println!("  --input     <file>   File to transmit (required)");
+    println!("  --output    <wav>    Output WAV file  (required)");
+    println!("  --callsign  <CALL>   Station callsign (required, e.g. HB9TOB)");
     println!("  --mod    <mod>       bpsk | qpsk | 16qam | 32qam | 64qam  [default: qpsk]");
     println!("  --rate   <rate>      1/2 | 2/3 | 3/4 | 5/6                [default: 3/4]");
     println!("  --rs     <0|1|2>     RS protection level                   [default: 1]");
@@ -155,9 +161,13 @@ fn main() {
     let (_, rs_k, _) = cfg.rs_level.params();
     let pkt_per_frame = max_packets_per_frame(cfg.modulation, cfg.ldpc_rate, cfg.rs_level);
 
-    // Flatten all super-frames; take only the real part (baseband audio).
-    let samples_f: Vec<f32> = frames.iter()
-        .flat_map(|f| f.iter().map(|s| s.re))
+    // Build beacon (1 kHz tone + ZC pair + ANN with callsign/mode/filename).
+    let mode_str = format!("{} {}", mod_label(cfg.modulation), rate_label(cfg.ldpc_rate));
+    let beacon = build_beacon(&cfg.callsign, &name, &mode_str);
+
+    // Flatten beacon + all super-frames; take only the real part (baseband audio).
+    let samples_f: Vec<f32> = beacon.iter().map(|s| s.re)
+        .chain(frames.iter().flat_map(|f| f.iter().map(|s| s.re)))
         .collect();
     let n_base_samples = samples_f.len();
 
@@ -179,8 +189,11 @@ fn main() {
 
     let duration_s = n_base_samples as f64 / FS_BASE as f64;
     let wav_bytes  = std::fs::metadata(&cfg.output).map(|m| m.len()).unwrap_or(0);
+    use rustpic::ofdm::{beacon::BEACON_TOTAL_SYMS, params::SYMBOL_LEN as SYM};
+    let beacon_ms = BEACON_TOTAL_SYMS * SYM * 1000 / FS_BASE as usize;
 
     println!("RustPIC TX");
+    println!("  Callsign : {}", cfg.callsign);
     println!("  Input    : {} ({} bytes)", cfg.input, raw.len());
     println!("  Mode     : {}  {}  RS-L{}{}",
         mod_label(cfg.modulation),
@@ -188,8 +201,9 @@ fn main() {
         match cfg.rs_level { RsLevel::L0 => "0", RsLevel::L1 => "1", RsLevel::L2 => "2" },
         if cfg.resync { "  resync" } else { "" });
     println!("  RS pkts  : {} total, ≤ {}/frame, rs_k={}", (raw.len() + 4).div_ceil(rs_k), pkt_per_frame, rs_k);
+    println!("  Beacon   : {} ms (1 kHz VOX tone + ZC + indicatif)", beacon_ms);
     println!("  Frames   : {}", n_frames);
-    println!("  Duration : {:.1} s  ({} samples @ {} Hz)", duration_s, n_base_samples, FS_BASE);
+    println!("  Duration : {:.1} s  ({} samples @ {} Hz, beacon included)", duration_s, n_base_samples, FS_BASE);
     println!("  Output   : {}  ({} bytes, 48 kHz 16-bit stereo)", cfg.output, wav_bytes);
 }
 

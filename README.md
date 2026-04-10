@@ -202,18 +202,24 @@ $ cargo run --release --bin simtest -- \
 ### Transmitter — `tx`
 
 ```bash
-cargo run --release --bin tx -- --input <file> --output <out.wav> [OPTIONS]
+cargo run --release --bin tx -- --input <file> --output <out.wav> --callsign <CALL> [OPTIONS]
 ```
 
 | Option | Values | Default |
 |--------|--------|---------|
+| `--callsign` | e.g. `HB9TOB` | *required* |
 | `--mod` | `bpsk` `qpsk` `16qam` `32qam` `64qam` | `qpsk` |
 | `--rate` | `1/2` `2/3` `3/4` `5/6` | `3/4` |
 | `--rs` | `0` `1` `2` | `1` (L1) |
 | `--resync` | flag | off |
 
-The output WAV is 48 kHz 16-bit stereo.  The filename of `--input` is embedded in the
-payload so the receiver can restore it without any metadata on the command line.
+Every transmission is preceded by a **612 ms beacon** that:
+- plays a 1 kHz tone for 360 ms (activates VOX-switched transmitters)
+- follows with a ZC preamble + 5 BPSK OFDM symbols carrying `"DE <CALL> <mode> <filename>"`
+- lets the TX chain and repeater squelch fully open before data starts
+
+The filename of `--input` is also embedded in the data payload so the receiver
+restores the original filename automatically.
 
 ### Receiver — `rx`
 
