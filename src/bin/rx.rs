@@ -336,27 +336,34 @@ fn main() {
 
 // ── Audio helpers ─────────────────────────────────────────────────────────────
 
-/// 13-tap Hamming-windowed sinc LPF, fc = 4 kHz @ 48 kHz, group delay = 6 samples.
+/// 51-tap Kaiser (β=4.0) lowpass FIR, fc = 4 kHz @ 48 kHz, group delay = 25 samples.
 ///
-/// H[0] = H[12] = 0 (sinc zeros): the filter is purely backward-looking when applied
-/// at output sample boundaries, so no future-symbol content bleeds into the FFT window.
-/// Group delay = 6 samples at 48 kHz = 1 sample at 8 kHz — absorbed by the CP (32 samp).
+/// Matched to the TX upsampling FIR.  Rejects the ZOH images that the TX would
+/// have left at 5469–8312 Hz, 13469–18531 Hz, etc. by > 45 dB, preventing them
+/// from aliasing onto our 312–2531 Hz signal band after 6× downsampling.
+///
+/// Group delay = 25 samples at 48 kHz ≈ 4.2 samples at 8 kHz → absorbed by
+/// the cyclic prefix (32 samples at 8 kHz).
 fn downsample_fir(src: &[f32], factor: usize) -> Vec<f32> {
     #[allow(clippy::excessive_precision)]
-    const H: [f32; 13] = [
-        0.000000,
-        0.005340, 0.025310, 0.067900, 0.125750, 0.176970,
-        0.197480,
-        0.176970, 0.125750, 0.067900, 0.025310, 0.005340,
-        0.000000,
+    const H: [f32; 51] = [
+         0.00056532,  0.00000000, -0.00105411, -0.00236732, -0.00346343,
+        -0.00373212, -0.00264242,  0.00000000,  0.00384348,  0.00792689,
+         0.01082997,  0.01104256,  0.00747959,  0.00000000, -0.01024440,
+        -0.02078281, -0.02819854, -0.02886428, -0.01988394,  0.00000000,
+         0.02979622,  0.06615781,  0.10386272,  0.13680683,  0.15928809,
+         0.16726782,
+         0.15928809,  0.13680683,  0.10386272,  0.06615781,  0.02979622,
+         0.00000000, -0.01988394, -0.02886428, -0.02819854, -0.02078281,
+        -0.01024440,  0.00000000,  0.00747959,  0.01104256,  0.01082997,
+         0.00792689,  0.00384348,  0.00000000, -0.00264242, -0.00373212,
+        -0.00346343, -0.00236732, -0.00105411,  0.00000000,  0.00056532,
     ];
-    const HALF: usize = H.len() / 2; // = 6
+    const HALF: usize = (H.len() - 1) / 2; // = 25
     let n_out = src.len() / factor;
     (0..n_out).map(|n| {
         let center = n * factor;
         H.iter().enumerate().map(|(k, &hk)| {
-            // center - k + HALF: tap k looks back (k > HALF) or forward (k < HALF).
-            // With H[0]=H[12]=0 the two forward taps contribute nothing.
             let idx = center as isize - k as isize + HALF as isize;
             if idx >= 0 && (idx as usize) < src.len() { hk * src[idx as usize] } else { 0.0 }
         }).sum()

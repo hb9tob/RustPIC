@@ -64,6 +64,7 @@ use crate::ofdm::rx::{
     equalizer::SymbolEqualizer,
     mode_detect::{LdpcRate, ModeHeader, Modulation},
 };
+use crate::ofdm::scrambler::G3ruhScrambler;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -227,9 +228,10 @@ pub struct FrameReceiver {
     packets_this_frame:  usize,
 
     // ── Processing units ──────────────────────────────────────────────────────
-    equalizer: SymbolEqualizer,
-    code:      LdpcCode,
-    rs:        RsCodec,
+    equalizer:    SymbolEqualizer,
+    code:         LdpcCode,
+    rs:           RsCodec,
+    descrambler:  G3ruhScrambler,
 
     // ── Accumulation buffers ──────────────────────────────────────────────────
     llr_buf:    Vec<f32>,
@@ -292,11 +294,12 @@ impl FrameReceiver {
             total_ldpc_blocks,
             total_data_syms,
             packets_this_frame,
-            equalizer: SymbolEqualizer::from_preamble(channel_est, alpha),
+            equalizer:    SymbolEqualizer::from_preamble(channel_est, alpha),
             code,
-            rs:         RsCodec::for_level(header.rs_level),
-            llr_buf:    Vec::new(),
-            info_bits:  Vec::new(),
+            rs:           RsCodec::for_level(header.rs_level),
+            descrambler:  G3ruhScrambler::new(),
+            llr_buf:      Vec::new(),
+            info_bits:    Vec::new(),
             rs_payload: Vec::new(),
             data_syms_received:  0,
             syms_in_group:       0,
@@ -394,8 +397,9 @@ impl FrameReceiver {
         while self.llr_buf.len() >= LDPC_N
             && self.ldpc_blocks_decoded < self.total_ldpc_blocks
         {
-            // Consume exactly LDPC_N LLRs
-            let block_llrs: Vec<f32> = self.llr_buf.drain(..LDPC_N).collect();
+            // Consume exactly LDPC_N LLRs and descramble (G3RUH PRBS)
+            let mut block_llrs: Vec<f32> = self.llr_buf.drain(..LDPC_N).collect();
+            self.descrambler.descramble_llrs(&mut block_llrs);
 
             // Hard-decision bits before LDPC (for BER estimation)
             let hard_bits: Vec<u8> = block_llrs.iter()
@@ -867,7 +871,10 @@ mod tests {
         let bits_per_ofdm = NUM_DATA * bps; // 63
         let total_data_syms = total_coded_bits.div_ceil(bits_per_ofdm); // 155
 
-        let all_coded_bits = vec![0u8; total_coded_bits];
+        // Scramble exactly as TX does (pad to full OFDM boundary first, then scramble)
+        let mut all_coded_bits = vec![0u8; total_data_syms * bits_per_ofdm];
+        G3ruhScrambler::new().scramble_bits(&mut all_coded_bits);
+
         let mut ofdm_syms: Vec<Vec<Complex32>> = Vec::new();
         for sym_idx in 0..total_data_syms {
             let start    = sym_idx * bits_per_ofdm;

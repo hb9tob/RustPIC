@@ -3,12 +3,16 @@
 //! USAGE: tx --input <file> --output <file.wav> [OPTIONS]
 //!
 //! OPTIONS:
-//!   --input  <file>      File to transmit (required)
-//!   --output <file.wav>  Output WAV file  (required)
-//!   --mod    <mod>       bpsk | qpsk | 16qam | 32qam | 64qam  [default: qpsk]
-//!   --rate   <rate>      1/2 | 2/3 | 3/4 | 5/6                [default: 3/4]
-//!   --rs     <0|1|2>     RS protection level                   [default: 1]
-//!   --resync             Insert re-sync ZC symbols
+//!   --input    <file>    File to transmit (required)
+//!   --output   <file>    Output WAV file  (required)
+//!   --mod      <mod>     bpsk | qpsk | 16qam | 32qam | 64qam  [default: qpsk]
+//!   --rate     <rate>    1/2 | 2/3 | 3/4 | 5/6                [default: 3/4]
+//!   --rs       <0|1|2>   RS protection level                   [default: 1]
+//!   --no-resync          Disable re-sync ZC symbols (not recommended for BPSK/QPSK)
+//!   --papr   <dB>        Soft-clip threshold dB above RMS  [default: 12]
+//!                        Raises RMS ~5.7 dB vs raw OFDM to match FM-calibrated tools.
+//!                        Lower values clip more aggressively (more RMS, more ICI).
+//!   --no-papr            Disable PAPR clipping
 
 use std::io::Write as IoWrite;
 
@@ -40,6 +44,8 @@ struct Cfg {
     ldpc_rate:  LdpcRate,
     rs_level:   RsLevel,
     resync:     bool,
+    papr_clip:  Option<f32>,  // soft-clip threshold in dB above RMS; None = no clipping
+    gain_db:    f32,           // additional gain applied after peak normalisation (dB)
 }
 
 impl Default for Cfg {
@@ -51,7 +57,9 @@ impl Default for Cfg {
             modulation: Modulation::Qpsk,
             ldpc_rate:  LdpcRate::R3_4,
             rs_level:   RsLevel::L1,
-            resync:     false,
+            resync:     true,  // on by default — required for BPSK/QPSK over independent soundcards
+            papr_clip:  None,
+            gain_db:    0.0,
         }
     }
 }
@@ -66,6 +74,18 @@ fn parse_args() -> Cfg {
             "--output"    => { i += 1; cfg.output   = args[i].clone(); }
             "--callsign"  => { i += 1; cfg.callsign = args[i].to_uppercase(); }
             "--resync"    => { cfg.resync = true; }
+            "--no-resync" => { cfg.resync = false; }
+            "--papr" => {
+                i += 1;
+                cfg.papr_clip = Some(args[i].parse::<f32>()
+                    .unwrap_or_else(|_| die("--papr expects a dB value, e.g. --papr 12")));
+            }
+            "--no-papr" => { cfg.papr_clip = None; }
+            "--gain" => {
+                i += 1;
+                cfg.gain_db = args[i].parse::<f32>()
+                    .unwrap_or_else(|_| die("--gain expects a dB value, e.g. --gain 6"));
+            }
             "--mod"  => {
                 i += 1;
                 cfg.modulation = match args[i].as_str() {
@@ -116,10 +136,13 @@ fn print_help() {
     println!("  --input     <file>   File to transmit (required)");
     println!("  --output    <wav>    Output WAV file  (required)");
     println!("  --callsign  <CALL>   Station callsign (required, e.g. HB9TOB)");
-    println!("  --mod    <mod>       bpsk | qpsk | 16qam | 32qam | 64qam  [default: qpsk]");
-    println!("  --rate   <rate>      1/2 | 2/3 | 3/4 | 5/6                [default: 3/4]");
-    println!("  --rs     <0|1|2>     RS protection level                   [default: 1]");
-    println!("  --resync             Insert re-sync ZC symbols");
+    println!("  --mod       <mod>    bpsk | qpsk | 16qam | 32qam | 64qam  [default: qpsk]");
+    println!("  --rate      <rate>   1/2 | 2/3 | 3/4 | 5/6                [default: 3/4]");
+    println!("  --rs        <0|1|2>  RS protection level                   [default: 1]");
+    println!("  --no-resync          Disable re-sync ZC symbols (on by default)");
+    println!("  --papr  <dB>         PAPR soft-clip threshold dB above RMS [default: 12]");
+    println!("  --no-papr            Disable PAPR clipping");
+    println!("  --gain  <dB>         Additional audio gain in dB, e.g. --gain 6  (positive = louder)");
 }
 
 fn die(msg: &str) -> ! {
@@ -171,14 +194,29 @@ fn main() {
         .collect();
     let n_base_samples = samples_f.len();
 
+    // Optional soft-clip PAPR reduction (tanh-based, operates at 8 kHz).
+    // Computes RMS over the whole signal, then clips at `clip_db` above RMS.
+    // This raises the average level relative to the peak, increasing average
+    // FM deviation to match single-carrier or DRM-style modulations.
+    let samples_f = if let Some(clip_db) = cfg.papr_clip {
+        papr_clip(&samples_f, clip_db)
+    } else {
+        samples_f
+    };
+
     // Normalize so peak hits 90 % of i16 full-scale.
     let peak = samples_f.iter().map(|&x| x.abs()).fold(0f32, f32::max);
-    let scale = if peak > 1e-9 { 0.9 * 32767.0 / peak } else { 32767.0 };
+    let mut scale = if peak > 1e-9 { 0.9 * 32767.0 / peak } else { 32767.0 };
 
-    // Upsample 8 kHz → 48 kHz (linear interpolation).
+    // Optional additional gain (positive = louder, may cause soft clipping via clamp).
+    if cfg.gain_db != 0.0 {
+        scale *= 10_f32.powf(cfg.gain_db / 20.0);
+    }
+
+    // Upsample 8 kHz → 48 kHz (nearest-neighbour).
     let upsampled = upsample_linear(&samples_f, UP_FACTOR);
 
-    // Convert to i16.
+    // Convert to i16 (clamp handles occasional peaks when --gain is used).
     let samples_i16: Vec<i16> = upsampled
         .iter()
         .map(|&x| (x * scale).round().clamp(-32768.0, 32767.0) as i16)
@@ -195,11 +233,13 @@ fn main() {
     println!("RustPIC TX");
     println!("  Callsign : {}", cfg.callsign);
     println!("  Input    : {} ({} bytes)", cfg.input, raw.len());
-    println!("  Mode     : {}  {}  RS-L{}{}",
+    println!("  Mode     : {}  {}  RS-L{}{}{}{}",
         mod_label(cfg.modulation),
         rate_label(cfg.ldpc_rate),
         match cfg.rs_level { RsLevel::L0 => "0", RsLevel::L1 => "1", RsLevel::L2 => "2" },
-        if cfg.resync { "  resync" } else { "" });
+        if cfg.resync { "  resync" } else { "" },
+        if let Some(db) = cfg.papr_clip { format!("  papr-clip={db}dB") } else { String::new() },
+        if cfg.gain_db != 0.0 { format!("  gain={:+.1}dB", cfg.gain_db) } else { String::new() });
     println!("  RS pkts  : {} total, ≤ {}/frame, rs_k={}", (raw.len() + 4).div_ceil(rs_k), pkt_per_frame, rs_k);
     println!("  Beacon   : {} ms (1 kHz VOX tone + ZC + indicatif)", beacon_ms);
     println!("  Frames   : {}", n_frames);
@@ -209,13 +249,79 @@ fn main() {
 
 // ── Audio helpers ─────────────────────────────────────────────────────────────
 
-/// Nearest-neighbour upsampler: repeat each sample `factor` times.
+/// Soft-clip (tanh) PAPR reduction.
 ///
-/// Combined with the box-average downsampler used by the receiver,
-/// this round-trip is exact (nearest-neighbour × box-average = identity),
-/// avoiding the non-linear phase distortion introduced by linear interpolation.
+/// Computes the RMS of `samples`, then applies `x → thr·tanh(x/thr)`
+/// where `thr = rms × 10^(clip_db/20)`.
+///
+/// Example: `clip_db = 6` → clips at 2×RMS → PAPR ≤ ~6 dB after renorm.
+/// This raises the RMS (and therefore the average FM deviation) by several dB,
+/// compensating for OFDM's inherently high PAPR.
+fn papr_clip(samples: &[f32], clip_db: f32) -> Vec<f32> {
+    let rms = (samples.iter().map(|&x| x * x).sum::<f32>() / samples.len() as f32).sqrt();
+    if rms < 1e-9 { return samples.to_vec(); }
+    let thr = rms * 10_f32.powf(clip_db / 20.0);
+    samples.iter().map(|&x| thr * (x / thr).tanh()).collect()
+}
+
+/// Band-limited upsampler: zero-insert by `factor` then apply a Kaiser-windowed
+/// sinc LPF at fc = 4 kHz (48 kHz rate).
+///
+/// ## Why this matters
+///
+/// ZOH (sample-repeat) upsampling leaves spectral images at k × 8 kHz in the
+/// 48 kHz output.  The nearest image falls at 5469–8312 Hz, only −8 dB below
+/// our 312–2531 Hz signal.  If the FM radio's audio input passes this range
+/// (common in data/WFM modes), the image is transmitted over the air.  The FM
+/// discriminator then returns it with 12–18 dB more noise (f² PSD), and the
+/// RX anti-alias FIR rejects it by only ~9 dB at 5469 Hz.  The aliased image
+/// degrades every subcarrier it folds onto.
+///
+/// This filter (51 taps, Kaiser β = 4.0, fc = 4 kHz @ 48 kHz, gain = 6)
+/// attenuates the first image by > 45 dB while keeping 0–2531 Hz flat
+/// (< 0.1 dB ripple).  Group delay = 25 samples at 48 kHz ≈ 4 samples at
+/// 8 kHz — well within the cyclic prefix (32 samples at 8 kHz).
 fn upsample_linear(src: &[f32], factor: usize) -> Vec<f32> {
-    src.iter().flat_map(|&x| std::iter::repeat(x).take(factor)).collect()
+    // 51-tap Kaiser (β=4.0) lowpass, fc=4000 Hz @ 48000 Hz, pre-scaled ×6.
+    // Computed with scipy.signal.firwin(51, 4000/24000, window=('kaiser',4.0))
+    // then multiplied by 6 to restore unity passband gain after zero-insertion.
+    #[allow(clippy::excessive_precision)]
+    const H: [f32; 51] = [
+         0.00339190,  0.00000000, -0.00632466, -0.01420392, -0.02078061,
+        -0.02239275, -0.01585454,  0.00000000,  0.02306087,  0.04756134,
+         0.06497979,  0.06625534,  0.04487754,  0.00000000, -0.06146642,
+        -0.12469687, -0.16919125, -0.17318569, -0.11930367,  0.00000000,
+         0.17877731,  0.39694688,  0.62317635,  0.82084101,  0.95572857,
+         1.00360694,
+         0.95572857,  0.82084101,  0.62317635,  0.39694688,  0.17877731,
+         0.00000000, -0.11930367, -0.17318569, -0.16919125, -0.12469687,
+        -0.06146642,  0.00000000,  0.04487754,  0.06625534,  0.06497979,
+         0.04756134,  0.02306087,  0.00000000, -0.01585454, -0.02239275,
+        -0.02078061, -0.01420392, -0.00632466,  0.00000000,  0.00339190,
+    ];
+    const NTAPS: usize = 51;
+    const HALF:  usize = (NTAPS - 1) / 2; // = 25, group delay in 48 kHz samples
+
+    let n_out = src.len() * factor;
+
+    (0..n_out).map(|out_idx| {
+        // The zero-inserted upsampled stream is non-zero only at multiples of
+        // `factor`.  For each output sample, iterate over filter taps and
+        // accumulate only where the (shifted) tap position aligns with an input.
+        H.iter().enumerate().map(|(tap, &hk)| {
+            // Guard against underflow: out_idx + HALF >= tap is always true
+            // when out_idx >= 0 and tap <= HALF (first half of filter), but
+            // we need to check for the second half.
+            if tap > out_idx + HALF { return 0.0; }
+            let shifted = out_idx + HALF - tap;
+            if shifted % factor == 0 {
+                let src_idx = shifted / factor;
+                if src_idx < src.len() { hk * src[src_idx] } else { 0.0 }
+            } else {
+                0.0
+            }
+        }).sum()
+    }).collect()
 }
 
 // ── WAV writer ────────────────────────────────────────────────────────────────

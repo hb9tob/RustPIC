@@ -29,6 +29,7 @@ use crate::ofdm::{
         frame::{blocks_per_rs_group, crc32_ieee, max_packets_per_frame},
         mode_detect::{encode_mode_header, LdpcRate, ModeHeader, Modulation},
     },
+    scrambler::G3ruhScrambler,
     tx::{bits_to_symbol, ofdm_modulate, ofdm_modulate_all_carriers},
     zc::build_preamble,
 };
@@ -176,10 +177,18 @@ fn build_frame_internal(
         }
     }
 
-    // ── 2. Slice into OFDM data symbols ───────────────────────────────────────
+    // ── 2. Scramble coded bits (PRBS-15) then pad ─────────────────────────────
+    // Scramble first so the padding zeros become pseudo-random, preventing
+    // long all-+1 BPSK runs that cause PAPR spikes.
     let bits_per_ofdm   = NUM_DATA * bps;
     let total_data_syms = all_coded_bits.len().div_ceil(bits_per_ofdm);
-    all_coded_bits.resize(total_data_syms * bits_per_ofdm, 0);
+    let padded_len      = total_data_syms * bits_per_ofdm;
+
+    // Generate enough PRBS bits to cover the final padded length before
+    // resizing, so the scrambler state stays aligned with what RX will see.
+    let mut prbs = G3ruhScrambler::new();
+    all_coded_bits.resize(padded_len, 0);
+    prbs.scramble_bits(&mut all_coded_bits);
 
     let data_ofdm_syms: Vec<Vec<Complex32>> = (0..total_data_syms)
         .map(|i| {

@@ -211,12 +211,16 @@ cargo run --release --bin tx -- --input <file> --output <out.wav> --callsign <CA
 | `--mod` | `bpsk` `qpsk` `16qam` `32qam` `64qam` | `qpsk` |
 | `--rate` | `1/2` `2/3` `3/4` `5/6` | `3/4` |
 | `--rs` | `0` `1` `2` | `1` (L1) |
-| `--resync` | flag | off |
+| `--no-resync` | flag | resync **on** by default |
 
 Every transmission is preceded by a **612 ms beacon** that:
 - plays a 1 kHz tone for 360 ms (activates VOX-switched transmitters)
 - follows with a ZC preamble + 5 BPSK OFDM symbols carrying `"DE <CALL> <mode> <filename>"`
 - lets the TX chain and repeater squelch fully open before data starts
+
+Re-sync ZC symbols are inserted every 12 data symbols by default (`--no-resync` to disable).
+They allow the receiver to correct accumulated clock drift between independent soundcards — critical
+for long frames (BPSK/QPSK) where even 100 ppm offset accumulates to multiple samples.
 
 The filename of `--input` is also embedded in the data payload so the receiver
 restores the original filename automatically.

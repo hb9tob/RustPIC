@@ -105,6 +105,19 @@ pub const fn is_pilot(k: usize) -> bool {
     k % PILOT_SPACING == 0
 }
 
+/// FM pre-emphasis gain for active-carrier index `k` (0 … NUM_CARRIERS−1).
+///
+/// Returns `f_k / f_0 = carrier_to_bin(k) / FIRST_BIN`, proportional to the
+/// subcarrier frequency.  Can be used to compensate the FM discriminator's
+/// parabolic noise PSD (∝ f²) by boosting high-frequency subcarriers at TX.
+///
+/// Not currently applied — kept as a utility for future use.
+#[inline(always)]
+#[allow(dead_code)]
+pub fn preemphasis_gain(k: usize) -> f32 {
+    carrier_to_bin(k) as f32 / FIRST_BIN as f32
+}
+
 /// Returns the signed BPSK value (+1 or −1) for pilot `k` using a simple
 /// length-9 m-sequence–derived pattern.
 ///

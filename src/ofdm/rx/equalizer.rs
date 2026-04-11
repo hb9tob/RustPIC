@@ -171,6 +171,37 @@ impl SymbolEqualizer {
         }
         self.syms_since_resync += 1;
 
+        // ── 1c. Common Phase Error (CPE) correction ──────────────────────────
+        // FM oscillator phase noise rotates ALL subcarriers by the same angle
+        // every symbol. Estimate the common rotation from pilots vs the current
+        // channel estimate, then remove it before the EMA update so the EMA
+        // only tracks slow frequency-selective fading.
+        //
+        //   CPE = arg( Σ_p  (Y[pilot_k] / expected_p)  ×  conj(H_ema[pilot_k]) )
+        //
+        // Summing the complex products (instead of averaging angles) avoids
+        // wrap-around artefacts when individual pilot estimates are noisy.
+        let cpe: f32 = {
+            let sum: Complex32 = (0..NUM_PILOTS)
+                .map(|p| {
+                    let k      = p * PILOT_SPACING;
+                    let h_meas = y[k] / Complex32::new(pilot_sign(k), 0.0);
+                    h_meas * self.h[k].conj()
+                })
+                .fold(Complex32::new(0.0, 0.0), |acc, v| acc + v);
+            sum.arg() // radians in (−π, +π]
+        };
+        // Rotate the whole symbol by −CPE so EMA sees only channel variation.
+        // Threshold: skip correction when |CPE| < 0.1 rad (≈ 6°) — below this
+        // the estimate is dominated by pilot noise and the correction degrades
+        // performance rather than improving it.
+        if cpe.abs() > 0.1 {
+            let corr = Complex32::from_polar(1.0, -cpe);
+            for k in 0..NUM_CARRIERS {
+                y[k] *= corr;
+            }
+        }
+
         // ── 2. Pilot observation & EMA update ────────────────────────────────
         // pilot_h[p] = channel at the p-th pilot subcarrier (p = 0..NUM_PILOTS)
         let mut pilot_h    = Vec::with_capacity(NUM_PILOTS);
@@ -208,13 +239,22 @@ impl SymbolEqualizer {
         }
 
         // ── 4. ZF equalization — data subcarriers only ────────────────────────
-        // σ²_channel: pre-equalization noise power (estimated from pilots)
-        // σ²_eq[k]  = σ²_channel / |H[k]|²
+        // FM discriminator noise PSD ∝ f² → noise variance at subcarrier k is
+        //   σ²[k] = σ²_ref × (bin_k / bin_ref)²  / |H[k]|²
+        //
+        // σ²_channel is estimated from pilot residuals, averaged over all pilots.
+        // The pilots span bins {FIRST_BIN, …, FIRST_BIN+64}, so sigma2_channel
+        // ≈ α_FM × mean(bin_pilot²) where α_FM is the FM noise coefficient.
+        // Dividing by mean_pilot_bin² recovers α_FM; multiplying by bin_k² gives
+        // the correct per-carrier noise variance.
+        //
+        // This re-weighting makes LDPC LLRs reliable: low-frequency subcarriers
+        // (small bin, quiet) get tight LLRs; high-frequency (noisy) get wide LLRs.
         let sigma2_channel = mean_pilot_err2
             * pilot_h.iter().map(|h| h.norm_sqr()).sum::<f32>()
             / NUM_PILOTS as f32;
 
-        let mut data     = Vec::with_capacity(NUM_DATA);
+        let mut data      = Vec::with_capacity(NUM_DATA);
         let mut noise_var = Vec::with_capacity(NUM_DATA);
 
         for k in 0..NUM_CARRIERS {

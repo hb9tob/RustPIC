@@ -69,7 +69,7 @@ pub(crate) fn zc_freq_to_time_domain(zc: &[Complex32]) -> Vec<Complex32> {
         "ZC freq vector must have length NUM_CARRIERS={NUM_CARRIERS}"
     );
 
-    // Build FFT input: place ZC on active subcarriers, zeros elsewhere.
+    // Build FFT input: place ZC on active subcarriers.
     let mut freq = vec![Complex32::new(0.0, 0.0); FFT_SIZE];
     for (k, &s) in zc.iter().enumerate() {
         freq[carrier_to_bin(k)] = s;
