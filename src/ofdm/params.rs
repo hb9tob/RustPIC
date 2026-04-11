@@ -107,6 +107,14 @@ pub const ZC_LEN: usize = NUM_CARRIERS; // 47
 /// A single re-sync ZC symbol is inserted every `RESYNC_PERIOD` data symbols.
 pub const RESYNC_PERIOD: usize = 12;
 
+/// Number of back-to-back BPSK OFDM symbols that carry the **same** mode
+/// header. The RX reads all `MODE_HEADER_REPEAT` copies, equalises each
+/// independently and does a majority vote per bit before the CRC check.
+/// Protects against a single-symbol FM click wiping out the packet count /
+/// modulation / rate field — where the old single-symbol header would give
+/// a CRC-10 false positive roughly once every 1000 attempts.
+pub const MODE_HEADER_REPEAT: usize = 3;
+
 /// Minimum number of data symbols remaining before inserting a re-sync ZC.
 pub const RESYNC_MIN_REMAIN: usize = 6;
 

@@ -223,7 +223,13 @@ fn build_frame_internal(
     let hdr_sc: Vec<Complex32> = hdr_bpsk.iter()
         .map(|&s| Complex32::new(s, 0.0))
         .collect();
-    samples.extend_from_slice(&ofdm_modulate_all_carriers(&hdr_sc));
+    // Emit MODE_HEADER_REPEAT identical copies of the mode-header OFDM symbol
+    // back-to-back. The RX equalises each independently, majority-votes the
+    // bits, then verifies the CRC-10 on the voted result.
+    let mode_hdr_sym = ofdm_modulate_all_carriers(&hdr_sc);
+    for _ in 0..MODE_HEADER_REPEAT {
+        samples.extend_from_slice(&mode_hdr_sym);
+    }
 
     for (data_sym_idx, sym) in data_ofdm_syms.iter().enumerate() {
         if config.has_resync && data_sym_idx > 0 && data_sym_idx % RESYNC_PERIOD == 0 {
@@ -283,10 +289,16 @@ mod tests {
 
         correct_cfo(&mut samples[sync.preamble_start..], sync.cfo_hz);
 
-        // Mode header
+        // Mode header — MODE_HEADER_REPEAT identical copies, soft-combined.
         let hdr_start  = sync.header_start;
-        let hdr_win    = &samples[hdr_start + CP_LEN..hdr_start + SYMBOL_LEN];
-        let header     = decode_mode_header(hdr_win, &sync.channel_est)
+        let hdr_windows: Vec<&[Complex32]> = (0..MODE_HEADER_REPEAT)
+            .map(|r| {
+                let off = hdr_start + r * SYMBOL_LEN;
+                &samples[off + CP_LEN..off + SYMBOL_LEN]
+            })
+            .collect();
+        let header     = crate::ofdm::rx::mode_detect::decode_mode_header_repeated(
+                &hdr_windows, &sync.channel_est)
             .unwrap_or_else(|e| panic!("header decode failed: {e}"));
 
         assert_eq!(header.modulation, config.modulation);
@@ -296,7 +308,7 @@ mod tests {
 
         // Frame receiver
         let mut rx  = FrameReceiver::new(&header, &sync.channel_est, 0.1);
-        let data_start = hdr_start + SYMBOL_LEN;
+        let data_start = hdr_start + MODE_HEADER_REPEAT * SYMBOL_LEN;
         let n_expected = rx.expected_symbol_count();
         let mut frame_result = None;
 

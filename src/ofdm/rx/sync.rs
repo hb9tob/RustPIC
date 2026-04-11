@@ -255,7 +255,18 @@ impl ZcCorrelator {
             }
         }
 
-        if confirm_metric < self.confirm_threshold {
+        // Soft-sync fallback: if ZC#2 is too weak to confirm but ZC#1 is very
+        // strong (≥ 0.65, well above the nominal 0.35 primary threshold), accept
+        // the detection anyway.  This handles the real-world case where a short
+        // FM click or a narrowband interferer wipes out a single symbol — the
+        // first ZC survives, the second does not.  CFO estimation is skipped
+        // (set to 0) because it needs a clean ZC#2, but the clock-tracking
+        // path and the re-sync ZCs recover timing for subsequent symbols.
+        const SOFT_SYNC_M1_MIN: f32 = 0.65;
+        let soft_sync = confirm_metric < self.confirm_threshold
+            && best_metric >= SOFT_SYNC_M1_MIN;
+
+        if confirm_metric < self.confirm_threshold && !soft_sync {
             return Err(SyncError::ConfirmationFailed {
                 first_metric: best_metric,
                 second_metric: confirm_metric,
@@ -264,9 +275,15 @@ impl ZcCorrelator {
         }
 
         // ── Stage 3: CFO estimation from the two ZC preambles ─────────────────
+        // Skipped when the sync is the soft-fallback case — we have no reliable
+        // ZC#2 to measure the per-symbol phase rotation against.
         let zc1 = &samples[best_pos..best_pos + SYMBOL_LEN];
-        let zc2 = &samples[zc2_start..zc2_start + SYMBOL_LEN];
-        let cfo_hz = estimate_cfo(zc1, zc2);
+        let cfo_hz = if soft_sync {
+            0.0
+        } else {
+            let zc2 = &samples[zc2_start..zc2_start + SYMBOL_LEN];
+            estimate_cfo(zc1, zc2)
+        };
 
         // ── Stage 4: channel estimation from ZC#1 ─────────────────────────────
         // Strip the CP: the FFT window starts at CP_LEN.

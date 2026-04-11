@@ -11,13 +11,13 @@ use num_complex::Complex32;
 use rustpic::{
     ofdm::{
         beacon::{try_decode_beacon, BEACON_ANN_SYMS, BEACON_SKIP_TO_DATA},
-        params::{CP_LEN, RESYNC_PERIOD, SAMPLE_RATE, SYMBOL_LEN},
+        params::{CP_LEN, MODE_HEADER_REPEAT, RESYNC_PERIOD, SAMPLE_RATE, SYMBOL_LEN},
         rx::{
             frame::{
                 FrameReceiver, PushResult, TransmissionReceiver, TxPushResult,
                 max_packets_per_frame,
             },
-            mode_detect::{decode_mode_header, LdpcRate, ModeHeader, Modulation},
+            mode_detect::{decode_mode_header_repeated, LdpcRate, ModeHeader, Modulation},
             sync::{correct_cfo, find_resync_zc, ZcCorrelator},
         },
     },
@@ -164,17 +164,24 @@ fn main() {
         let mut buf: Vec<Complex32> = audio[abs_preamble..].to_vec();
         correct_cfo(&mut buf, sync.cfo_hz);
 
-        // Decode mode header.
+        // Decode mode header — read MODE_HEADER_REPEAT identical copies and
+        // soft-combine them for ~√N SNR gain before the CRC-10 check.
         let hdr_rel = sync.header_start - sync.preamble_start;
-        if hdr_rel + SYMBOL_LEN > buf.len() {
+        if hdr_rel + MODE_HEADER_REPEAT * SYMBOL_LEN > buf.len() {
             search_start += SYMBOL_LEN;
             continue;
         }
-        let hdr_win = &buf[hdr_rel + CP_LEN..hdr_rel + SYMBOL_LEN];
-        let header  = match decode_mode_header(hdr_win, &sync.channel_est) {
+        let hdr_windows: Vec<&[Complex32]> = (0..MODE_HEADER_REPEAT)
+            .map(|r| {
+                let off = hdr_rel + r * SYMBOL_LEN;
+                &buf[off + CP_LEN..off + SYMBOL_LEN]
+            })
+            .collect();
+        let header  = match decode_mode_header_repeated(&hdr_windows, &sync.channel_est) {
             Ok(h)  => h,
             Err(_) => {
                 // Check if this is a beacon frame (ANN symbols after ZC pair).
+                // The beacon still uses a single announcement block — no repetition.
                 let ann_start = hdr_rel; // same offset as the mode header
                 let ann_end   = ann_start + BEACON_ANN_SYMS * SYMBOL_LEN;
                 if ann_end <= buf.len() {
@@ -212,15 +219,19 @@ fn main() {
 
         // Pre-pad buffer against clock-drift tail truncation.
         {
-            let nominal_end = (3 + n_expected) * SYMBOL_LEN;
+            let nominal_end = (2 + MODE_HEADER_REPEAT + n_expected) * SYMBOL_LEN;
             if buf.len() < nominal_end {
                 buf.resize(nominal_end, Complex32::new(0.0, 0.0));
             }
         }
 
         // Symbol-by-symbol processing with drift tracking (mirrors simtest).
+        // Symbol indices in one super-frame:
+        //   0..2                             → ZC#1, ZC#2
+        //   2..2+MODE_HEADER_REPEAT          → mode-header copies
+        //   2+MODE_HEADER_REPEAT..           → data (+ optional resync ZCs)
         let mut rate_est:      f64   = 1.0;
-        let mut k_sym:         i64   = 3; // 0=ZC1 1=ZC2 2=hdr 3=first data
+        let mut k_sym:         i64   = 2 + MODE_HEADER_REPEAT as i64;
         let mut syms_in_group: usize = 0;
         let mut data_received: usize = 0;
         let mut last_resync: Option<(usize, i64)> = None;
@@ -331,7 +342,7 @@ fn main() {
             TxPushResult::NeedMoreFrames => {}
         }
 
-        search_start = abs_preamble + (3 + n_expected) * SYMBOL_LEN;
+        search_start = abs_preamble + (2 + MODE_HEADER_REPEAT + n_expected) * SYMBOL_LEN;
     }
 
     // ── End-of-audio summary ──────────────────────────────────────────────────

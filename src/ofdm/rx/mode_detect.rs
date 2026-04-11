@@ -281,27 +281,48 @@ pub fn decode_mode_header(
     fft_window:  &[Complex32],
     channel_est: &[Complex32],
 ) -> Result<ModeHeader, ModeError> {
-    // ── Validate lengths ──────────────────────────────────────────────────────
-    if fft_window.len() != FFT_SIZE {
-        return Err(ModeError::BadFftWindowLen { got: fft_window.len() });
+    decode_mode_header_repeated(std::slice::from_ref(&fft_window), channel_est)
+}
+
+/// Decodes the mode header from **one or more** repeated BPSK OFDM symbols.
+///
+/// When MODE_HEADER_REPEAT > 1, the TX emits several identical copies of the
+/// mode-header symbol back-to-back. This routine equalises each copy against
+/// the same ZC-derived channel estimate, sums the equalised complex values
+/// per carrier (soft combining — gives ~√N SNR gain because the noise is
+/// approximately uncorrelated between symbols while the signal adds
+/// coherently), then hard-decides the BPSK bits and verifies the CRC-10.
+///
+/// A single-symbol input is identical to the legacy single-pass decode.
+pub fn decode_mode_header_repeated(
+    fft_windows: &[&[Complex32]],
+    channel_est: &[Complex32],
+) -> Result<ModeHeader, ModeError> {
+    if fft_windows.is_empty() {
+        return Err(ModeError::BadFftWindowLen { got: 0 });
     }
     if channel_est.len() != NUM_CARRIERS {
         return Err(ModeError::BadChannelEstLen { got: channel_est.len() });
     }
+    for w in fft_windows {
+        if w.len() != FFT_SIZE {
+            return Err(ModeError::BadFftWindowLen { got: w.len() });
+        }
+    }
 
-    // ── FFT ───────────────────────────────────────────────────────────────────
-    let subcarriers = ofdm_demodulate(fft_window);
+    // Sum the equalised complex values across all repetitions.
+    let mut combined = vec![Complex32::new(0.0, 0.0); NUM_CARRIERS];
+    for window in fft_windows {
+        let subcarriers = ofdm_demodulate(window);
+        for (i, (&y, &h)) in subcarriers.iter().zip(channel_est.iter()).enumerate() {
+            combined[i] += zf_equalise(y, h);
+        }
+    }
 
-    // ── Zero-forcing equalisation ─────────────────────────────────────────────
-    let equalized: Vec<Complex32> = subcarriers.iter()
-        .zip(channel_est.iter())
-        .map(|(&y, &h)| zf_equalise(y, h))
-        .collect();
-
-    // ── BPSK hard decisions → 42 bits ────────────────────────────────────────
-    let bits: Vec<u8> = equalized.iter()
+    // ── BPSK hard decisions → NUM_CARRIERS bits ───────────────────────────────
+    let bits: Vec<u8> = combined.iter()
         .map(|c| u8::from(c.re >= 0.0))
-        .collect(); // 0 or 1, MSB at index 0
+        .collect();
 
     // ── Field extraction ──────────────────────────────────────────────────────
     let modulation_code    = bits_to_u8(&bits[0..3]);
