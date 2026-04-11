@@ -11,7 +11,7 @@ use num_complex::Complex32;
 use rustpic::{
     ofdm::{
         beacon::{try_decode_beacon, BEACON_ANN_SYMS, BEACON_SKIP_TO_DATA},
-        params::{CP_LEN, RESYNC_PERIOD, SYMBOL_LEN},
+        params::{CP_LEN, RESYNC_PERIOD, SAMPLE_RATE, SYMBOL_LEN},
         rx::{
             frame::{
                 FrameReceiver, PushResult, TransmissionReceiver, TxPushResult,
@@ -25,13 +25,8 @@ use rustpic::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const FS_IN:       u32   = 48_000;
-const FS_BASE:     u32   = 8_000;
-const DOWN_FACTOR: usize = (FS_IN / FS_BASE) as usize; // 6
-
-/// Scan window width used when sliding through unknown audio looking for a preamble.
-/// 4×SYMBOL_LEN (1152 samples) is large enough for ZcCorrelator and small enough
-/// that the first resync ZC (15 symbols after the true preamble) never falls inside.
+/// Scan window width: 4×SYMBOL_LEN is large enough for ZcCorrelator and small
+/// enough that the first resync ZC never falls inside the initial search window.
 const SCAN_WINDOW: usize = 4 * SYMBOL_LEN;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -68,7 +63,7 @@ fn print_help() {
     println!("  --input  <file.wav>  WAV file to scan (required)");
     println!("  --outdir <dir>       Output directory for decoded files  [default: .]");
     println!();
-    println!("The WAV must be 48 kHz or 8 kHz, 16-bit PCM (mono or stereo).");
+    println!("The WAV must be 48 kHz 16-bit PCM (mono or stereo).");
     println!("Multiple transmissions in the same file are all decoded.");
 }
 
@@ -99,19 +94,17 @@ fn main() {
     let (wav_samples, wav_rate) = read_wav_mono(&cfg.input)
         .unwrap_or_else(|e| die(&format!("cannot read '{}': {e}", cfg.input)));
 
-    // ── Resample to 8 kHz ─────────────────────────────────────────────────────
-    let samples_f32: Vec<f32> = match wav_rate {
-        r if r == FS_BASE => wav_samples,
-        r if r == FS_IN   => downsample_fir(&wav_samples, DOWN_FACTOR),
-        r => die(&format!("unsupported sample rate {r} Hz (expected 48000 or 8000)")),
-    };
+    // Verify sample rate.
+    if wav_rate != SAMPLE_RATE as u32 {
+        die(&format!("unsupported sample rate {wav_rate} Hz (expected 48000)"));
+    }
 
     // ── Convert to Complex32 (imaginary = 0) ──────────────────────────────────
-    let audio: Vec<Complex32> = samples_f32.iter()
+    let audio: Vec<Complex32> = wav_samples.iter()
         .map(|&x| Complex32::new(x, 0.0))
         .collect();
 
-    let duration_s = audio.len() as f64 / FS_BASE as f64;
+    let duration_s = audio.len() as f64 / SAMPLE_RATE as f64;
     println!("RustPIC RX");
     println!("  WAV      : {} ({} kHz, {:.1} s)",
         cfg.input, wav_rate / 1000, duration_s);
@@ -130,7 +123,7 @@ fn main() {
         // Progress indicator for long audio files (every ~10%).
         if search_start >= next_progress {
             let pct = search_start * 100 / audio.len();
-            eprint!("\r  Scanning  : {pct:3}% ({:.1} s)…    ", search_start as f64 / FS_BASE as f64);
+            eprint!("\r  Scanning  : {pct:3}% ({:.1} s)…    ", search_start as f64 / SAMPLE_RATE as f64);
             next_progress = search_start + audio.len() / 10;
         }
 
@@ -332,42 +325,6 @@ fn main() {
     }
     println!("  Decoded  : {n_files} file(s)  ({n_frames_seen} super-frame(s) total)");
     if n_files == 0 { std::process::exit(1); }
-}
-
-// ── Audio helpers ─────────────────────────────────────────────────────────────
-
-/// 51-tap Kaiser (β=4.0) lowpass FIR, fc = 4 kHz @ 48 kHz, group delay = 25 samples.
-///
-/// Matched to the TX upsampling FIR.  Rejects the ZOH images that the TX would
-/// have left at 5469–8312 Hz, 13469–18531 Hz, etc. by > 45 dB, preventing them
-/// from aliasing onto our 312–2531 Hz signal band after 6× downsampling.
-///
-/// Group delay = 25 samples at 48 kHz ≈ 4.2 samples at 8 kHz → absorbed by
-/// the cyclic prefix (32 samples at 8 kHz).
-fn downsample_fir(src: &[f32], factor: usize) -> Vec<f32> {
-    #[allow(clippy::excessive_precision)]
-    const H: [f32; 51] = [
-         0.00056532,  0.00000000, -0.00105411, -0.00236732, -0.00346343,
-        -0.00373212, -0.00264242,  0.00000000,  0.00384348,  0.00792689,
-         0.01082997,  0.01104256,  0.00747959,  0.00000000, -0.01024440,
-        -0.02078281, -0.02819854, -0.02886428, -0.01988394,  0.00000000,
-         0.02979622,  0.06615781,  0.10386272,  0.13680683,  0.15928809,
-         0.16726782,
-         0.15928809,  0.13680683,  0.10386272,  0.06615781,  0.02979622,
-         0.00000000, -0.01988394, -0.02886428, -0.02819854, -0.02078281,
-        -0.01024440,  0.00000000,  0.00747959,  0.01104256,  0.01082997,
-         0.00792689,  0.00384348,  0.00000000, -0.00264242, -0.00373212,
-        -0.00346343, -0.00236732, -0.00105411,  0.00000000,  0.00056532,
-    ];
-    const HALF: usize = (H.len() - 1) / 2; // = 25
-    let n_out = src.len() / factor;
-    (0..n_out).map(|n| {
-        let center = n * factor;
-        H.iter().enumerate().map(|(k, &hk)| {
-            let idx = center as isize - k as isize + HALF as isize;
-            if idx >= 0 && (idx as usize) < src.len() { hk * src[idx as usize] } else { 0.0 }
-        }).sum()
-    }).collect()
 }
 
 // ── Payload helpers ───────────────────────────────────────────────────────────

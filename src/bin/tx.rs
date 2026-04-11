@@ -20,6 +20,7 @@ use rustpic::{
     fec::rs::RsLevel,
     ofdm::{
         beacon::build_beacon,
+        params::SAMPLE_RATE,
         rx::{
             frame::max_packets_per_frame,
             mode_detect::{LdpcRate, Modulation},
@@ -27,12 +28,6 @@ use rustpic::{
         tx::frame::{build_transmission, FrameConfig},
     },
 };
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-const FS_BASE:   u32 = 8_000;
-const FS_OUT:    u32 = 48_000;
-const UP_FACTOR: usize = (FS_OUT / FS_BASE) as usize; // 6
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -194,10 +189,7 @@ fn main() {
         .collect();
     let n_base_samples = samples_f.len();
 
-    // Optional soft-clip PAPR reduction (tanh-based, operates at 8 kHz).
-    // Computes RMS over the whole signal, then clips at `clip_db` above RMS.
-    // This raises the average level relative to the peak, increasing average
-    // FM deviation to match single-carrier or DRM-style modulations.
+    // Optional soft-clip PAPR reduction (tanh-based).
     let samples_f = if let Some(clip_db) = cfg.papr_clip {
         papr_clip(&samples_f, clip_db)
     } else {
@@ -208,27 +200,24 @@ fn main() {
     let peak = samples_f.iter().map(|&x| x.abs()).fold(0f32, f32::max);
     let mut scale = if peak > 1e-9 { 0.9 * 32767.0 / peak } else { 32767.0 };
 
-    // Optional additional gain (positive = louder, may cause soft clipping via clamp).
+    // Optional additional gain.
     if cfg.gain_db != 0.0 {
         scale *= 10_f32.powf(cfg.gain_db / 20.0);
     }
 
-    // Upsample 8 kHz → 48 kHz (nearest-neighbour).
-    let upsampled = upsample_linear(&samples_f, UP_FACTOR);
-
-    // Convert to i16 (clamp handles occasional peaks when --gain is used).
-    let samples_i16: Vec<i16> = upsampled
+    // Convert to i16 — signal is already at 48 kHz natively, no resampling needed.
+    let samples_i16: Vec<i16> = samples_f
         .iter()
         .map(|&x| (x * scale).round().clamp(-32768.0, 32767.0) as i16)
         .collect();
 
-    write_wav_stereo(&cfg.output, &samples_i16, FS_OUT)
+    write_wav_stereo(&cfg.output, &samples_i16, SAMPLE_RATE as u32)
         .unwrap_or_else(|e| die(&format!("cannot write '{}': {e}", cfg.output)));
 
-    let duration_s = n_base_samples as f64 / FS_BASE as f64;
+    let duration_s = n_base_samples as f64 / SAMPLE_RATE as f64;
     let wav_bytes  = std::fs::metadata(&cfg.output).map(|m| m.len()).unwrap_or(0);
     use rustpic::ofdm::{beacon::BEACON_TOTAL_SYMS, params::SYMBOL_LEN as SYM};
-    let beacon_ms = BEACON_TOTAL_SYMS * SYM * 1000 / FS_BASE as usize;
+    let beacon_ms = BEACON_TOTAL_SYMS * SYM * 1000 / SAMPLE_RATE as usize;
 
     println!("RustPIC TX");
     println!("  Callsign : {}", cfg.callsign);
@@ -243,7 +232,7 @@ fn main() {
     println!("  RS pkts  : {} total, ≤ {}/frame, rs_k={}", (raw.len() + 4).div_ceil(rs_k), pkt_per_frame, rs_k);
     println!("  Beacon   : {} ms (1 kHz VOX tone + ZC + indicatif)", beacon_ms);
     println!("  Frames   : {}", n_frames);
-    println!("  Duration : {:.1} s  ({} samples @ {} Hz, beacon included)", duration_s, n_base_samples, FS_BASE);
+    println!("  Duration : {:.1} s  ({} samples @ {} Hz, beacon included)", duration_s, n_base_samples, SAMPLE_RATE as u32);
     println!("  Output   : {}  ({} bytes, 48 kHz 16-bit stereo)", cfg.output, wav_bytes);
 }
 
@@ -262,66 +251,6 @@ fn papr_clip(samples: &[f32], clip_db: f32) -> Vec<f32> {
     if rms < 1e-9 { return samples.to_vec(); }
     let thr = rms * 10_f32.powf(clip_db / 20.0);
     samples.iter().map(|&x| thr * (x / thr).tanh()).collect()
-}
-
-/// Band-limited upsampler: zero-insert by `factor` then apply a Kaiser-windowed
-/// sinc LPF at fc = 4 kHz (48 kHz rate).
-///
-/// ## Why this matters
-///
-/// ZOH (sample-repeat) upsampling leaves spectral images at k × 8 kHz in the
-/// 48 kHz output.  The nearest image falls at 5469–8312 Hz, only −8 dB below
-/// our 312–2531 Hz signal.  If the FM radio's audio input passes this range
-/// (common in data/WFM modes), the image is transmitted over the air.  The FM
-/// discriminator then returns it with 12–18 dB more noise (f² PSD), and the
-/// RX anti-alias FIR rejects it by only ~9 dB at 5469 Hz.  The aliased image
-/// degrades every subcarrier it folds onto.
-///
-/// This filter (51 taps, Kaiser β = 4.0, fc = 4 kHz @ 48 kHz, gain = 6)
-/// attenuates the first image by > 45 dB while keeping 0–2531 Hz flat
-/// (< 0.1 dB ripple).  Group delay = 25 samples at 48 kHz ≈ 4 samples at
-/// 8 kHz — well within the cyclic prefix (32 samples at 8 kHz).
-fn upsample_linear(src: &[f32], factor: usize) -> Vec<f32> {
-    // 51-tap Kaiser (β=4.0) lowpass, fc=4000 Hz @ 48000 Hz, pre-scaled ×6.
-    // Computed with scipy.signal.firwin(51, 4000/24000, window=('kaiser',4.0))
-    // then multiplied by 6 to restore unity passband gain after zero-insertion.
-    #[allow(clippy::excessive_precision)]
-    const H: [f32; 51] = [
-         0.00339190,  0.00000000, -0.00632466, -0.01420392, -0.02078061,
-        -0.02239275, -0.01585454,  0.00000000,  0.02306087,  0.04756134,
-         0.06497979,  0.06625534,  0.04487754,  0.00000000, -0.06146642,
-        -0.12469687, -0.16919125, -0.17318569, -0.11930367,  0.00000000,
-         0.17877731,  0.39694688,  0.62317635,  0.82084101,  0.95572857,
-         1.00360694,
-         0.95572857,  0.82084101,  0.62317635,  0.39694688,  0.17877731,
-         0.00000000, -0.11930367, -0.17318569, -0.16919125, -0.12469687,
-        -0.06146642,  0.00000000,  0.04487754,  0.06625534,  0.06497979,
-         0.04756134,  0.02306087,  0.00000000, -0.01585454, -0.02239275,
-        -0.02078061, -0.01420392, -0.00632466,  0.00000000,  0.00339190,
-    ];
-    const NTAPS: usize = 51;
-    const HALF:  usize = (NTAPS - 1) / 2; // = 25, group delay in 48 kHz samples
-
-    let n_out = src.len() * factor;
-
-    (0..n_out).map(|out_idx| {
-        // The zero-inserted upsampled stream is non-zero only at multiples of
-        // `factor`.  For each output sample, iterate over filter taps and
-        // accumulate only where the (shifted) tap position aligns with an input.
-        H.iter().enumerate().map(|(tap, &hk)| {
-            // Guard against underflow: out_idx + HALF >= tap is always true
-            // when out_idx >= 0 and tap <= HALF (first half of filter), but
-            // we need to check for the second half.
-            if tap > out_idx + HALF { return 0.0; }
-            let shifted = out_idx + HALF - tap;
-            if shifted % factor == 0 {
-                let src_idx = shifted / factor;
-                if src_idx < src.len() { hk * src[src_idx] } else { 0.0 }
-            } else {
-                0.0
-            }
-        }).sum()
-    }).collect()
 }
 
 // ── WAV writer ────────────────────────────────────────────────────────────────

@@ -1,10 +1,10 @@
 //! Mode header decoder.
 //!
 //! The **mode header** is the OFDM symbol immediately following the two ZC
-//! preambles.  All [`NUM_CARRIERS`] = 72 active subcarriers carry BPSK symbols
+//! preambles.  All [`NUM_CARRIERS`] = 47 active subcarriers carry BPSK symbols
 //! that encode the transmission parameters for the super-frame.
 //!
-//! # Bit layout  (72 BPSK symbols = 72 bits)
+//! # Bit layout  (47 BPSK symbols = 47 bits)
 //!
 //! ```text
 //!  Bits   Field                         Width  Notes
@@ -15,8 +15,7 @@
 //!   7     has_resync                     1    1 = periodic re-sync ZC present in frame
 //!   8–19  total_packet_count            12    12-bit field (max 4095 RS packets)
 //!  20–31  packet_offset                 12    12-bit field (max 4095)
-//!  32–47  crc16                         16    CRC-16/CCITT over bits 0–31 (4 bytes)
-//!  48–71  diversity                     24    bits 0–23 repeated for redundancy
+//!  32–46  crc15                         15    lower 15 bits of CRC-16/CCITT over bits 0–31
 //! ```
 //!
 //! The 12-bit `total_packet_count` supports up to 4095 RS packets (≥ 500 KB for all
@@ -27,16 +26,14 @@
 //! ```text
 //!  header FFT window (CP stripped)
 //!        │
-//!        ▼  FFT(256) → scale
-//!  Y[k], k=0..71
+//!        ▼  FFT(1024) → scale
+//!  Y[k], k=0..46
 //!        │
 //!        ▼  ZF equalisation  Y[k] / H_hat[k]
 //!  X̂[k]
 //!        │
 //!        ▼  BPSK hard decision  sign(Re(X̂[k]))
-//!  72 bits
-//!        │
-//!        ├── diversity_combine(bits[0..32], bits[40..72])
+//!  47 bits
 //!        │
 //!        ▼  field extraction + CRC check
 //!  ModeHeader
@@ -301,25 +298,10 @@ pub fn decode_mode_header(
         .map(|(&y, &h)| zf_equalise(y, h))
         .collect();
 
-    // ── BPSK hard decisions → 72 bits ────────────────────────────────────────
-    let raw_bits: Vec<u8> = equalized.iter()
+    // ── BPSK hard decisions → 47 bits ────────────────────────────────────────
+    let bits: Vec<u8> = equalized.iter()
         .map(|c| u8::from(c.re >= 0.0))
         .collect(); // 0 or 1, MSB at index 0
-
-    // ── Diversity combining ───────────────────────────────────────────────────
-    // Layout: raw_bits[0..48] = primary (48 bits)
-    //         raw_bits[48..72] = diversity copy of bits[0..24] (24 bits)
-    //
-    // Bits 0–23 have a redundant copy; bits 24–47 (CRC) are primary only.
-    // If both copies agree → confident.  If they disagree → keep primary
-    // (CRC will catch uncorrectable errors).
-    let mut bits = vec![0u8; 48];
-    for i in 0..24 {
-        let p = raw_bits[i];
-        let d = raw_bits[48 + i];
-        bits[i] = if p == d { p } else { p }; // prefer primary on disagreement
-    }
-    bits[24..48].copy_from_slice(&raw_bits[24..48]); // primary only (includes CRC)
 
     // ── Field extraction ──────────────────────────────────────────────────────
     let modulation_code    = bits_to_u8(&bits[0..3]);
@@ -328,7 +310,7 @@ pub fn decode_mode_header(
     let has_resync         = bits[7] == 1;
     let total_packet_count = bits_to_u16(&bits[8..20]);   // 12-bit field (max 4095)
     let packet_offset      = bits_to_u16(&bits[20..32]);  // 12-bit field (max 4095)
-    let crc_received       = bits_to_u16(&bits[32..48]);
+    let crc_received       = bits_to_u16(&bits[32..47]);  // lower 15 bits of CRC-16
 
     let modulation = Modulation::from_u8(modulation_code)
         .ok_or(ModeError::InvalidModulation(modulation_code))?;
@@ -337,9 +319,9 @@ pub fn decode_mode_header(
     let rs_level = RsLevel::from_u8(rs_level_code)
         .ok_or(ModeError::InvalidRsLevel(rs_level_code))?;
 
-    // ── CRC-16/CCITT over the first 4 bytes (bits 0–31) ──────────────────────
+    // ── CRC-15: lower 15 bits of CRC-16/CCITT over bits 0–31 ─────────────────
     let payload_bytes = bits_to_bytes(&bits[0..32]);
-    let crc_computed  = crc16_ccitt(&payload_bytes);
+    let crc_computed  = crc16_ccitt(&payload_bytes) & 0x7FFF;
     let crc_ok        = crc_computed == crc_received;
 
     if !crc_ok {
@@ -389,13 +371,15 @@ fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
 
 // ── Mode header encoder (TX side helper — keeps TX/RX in sync) ────────────────
 
-/// Encodes a [`ModeHeader`] into 72 BPSK symbols (+1 / −1) ready to be
-/// placed on the active subcarriers of the header OFDM symbol.
+/// Encodes a [`ModeHeader`] into [`NUM_CARRIERS`] BPSK symbols (+1 / −1) ready
+/// to be placed on the active subcarriers of the header OFDM symbol.
+///
+/// Layout: 32 data bits + 15-bit CRC (lower 15 bits of CRC-16/CCITT) = 47 bits.
 ///
 /// This is the **TX** counterpart to [`decode_mode_header`], kept here so the
 /// bit layout is defined in a single place.
 pub fn encode_mode_header(hdr: &ModeHeader) -> Vec<f32> {
-    let mut bits = vec![0u8; 48];
+    let mut bits = vec![0u8; NUM_CARRIERS]; // 47 bits
 
     // Field packing (MSB first)
     pack_bits_u8 (&mut bits[0..3],   hdr.modulation as u8,  3);
@@ -405,17 +389,13 @@ pub fn encode_mode_header(hdr: &ModeHeader) -> Vec<f32> {
     pack_bits    (&mut bits[8..20],  hdr.total_packet_count, 12);  // 12-bit field
     pack_bits    (&mut bits[20..32], hdr.packet_offset,      12);  // 12-bit field
 
-    // CRC-16 over first 4 bytes (bits 0–31)
+    // CRC-15: lower 15 bits of CRC-16/CCITT over first 4 bytes (bits 0–31)
     let payload_bytes = bits_to_bytes(&bits[0..32]);
-    let crc = crc16_ccitt(&payload_bytes);
-    pack_bits_u16(&mut bits[32..48], crc);
-
-    // 72-bit output: primary (48) + diversity = repeat first 24 bits
-    let mut out = bits.clone();
-    out.extend_from_slice(&bits[0..24]);
+    let crc = crc16_ccitt(&payload_bytes) & 0x7FFF;
+    pack_bits(&mut bits[32..47], crc, 15);
 
     // Map 0 → −1, 1 → +1
-    out.iter().map(|&b| if b == 1 { 1.0f32 } else { -1.0f32 }).collect()
+    bits.iter().map(|&b| if b == 1 { 1.0f32 } else { -1.0f32 }).collect()
 }
 
 fn pack_bits(dst: &mut [u8], val: u16, nbits: usize) {
@@ -426,12 +406,6 @@ fn pack_bits(dst: &mut [u8], val: u16, nbits: usize) {
 
 fn pack_bits_u8(dst: &mut [u8], val: u8, nbits: usize) {
     pack_bits(dst, val as u16, nbits);
-}
-
-fn pack_bits_u16(dst: &mut [u8], val: u16) {
-    for i in 0..16 {
-        dst[i] = ((val >> (15 - i)) & 1) as u8;
-    }
 }
 
 // ── CRC-16 / CCITT ────────────────────────────────────────────────────────────
@@ -475,7 +449,7 @@ mod tests {
             crc_ok:             true,
         };
 
-        // Encode → 72 BPSK symbols (+1/−1)
+        // Encode → NUM_CARRIERS BPSK symbols (+1/−1)
         let bpsk_symbols = encode_mode_header(&hdr_tx);
         assert_eq!(bpsk_symbols.len(), NUM_CARRIERS);
 

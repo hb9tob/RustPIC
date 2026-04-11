@@ -28,7 +28,7 @@ use num_complex::Complex32;
 use std::f32::consts::PI;
 
 use crate::ofdm::{
-    params::{CP_LEN, FFT_SIZE, NUM_CARRIERS, SYMBOL_LEN, carrier_to_bin},
+    params::{CP_LEN, FFT_SIZE, NUM_CARRIERS, SAMPLE_RATE, SYMBOL_LEN, carrier_to_bin},
     rx::mode_detect::crc16_ccitt,
     zc::build_preamble,
 };
@@ -39,7 +39,8 @@ use crate::ofdm::{
 pub const BEACON_TONE_SYMS: usize = 10;
 
 /// Number of BPSK OFDM symbols carrying the announcement text.
-pub const BEACON_ANN_SYMS: usize = 5;
+/// 8 × NUM_CARRIERS = 8 × 47 = 376 bits ≥ 360 bits required (magic+len+text+crc).
+pub const BEACON_ANN_SYMS: usize = 8;
 
 /// Total symbols in the beacon block (tone + 2×ZC + ANN).
 pub const BEACON_TOTAL_SYMS: usize = BEACON_TONE_SYMS + 2 + BEACON_ANN_SYMS; // 17
@@ -51,7 +52,6 @@ pub const BEACON_SKIP_TO_DATA: usize = 2 + BEACON_ANN_SYMS; // 7
 const BEACON_MAGIC: u16 = 0xDA1D;
 const BEACON_TEXT_BYTES: usize = 40; // max announcement text length
 const TONE_HZ: f32 = 1000.0;
-const FS: f32 = 8000.0;
 
 // ── Beacon info ───────────────────────────────────────────────────────────────
 
@@ -105,7 +105,7 @@ pub fn build_beacon(callsign: &str, filename: &str, mode_str: &str) -> Vec<Compl
     let tone_samples = BEACON_TONE_SYMS * SYMBOL_LEN;
     let mut out = Vec::with_capacity(BEACON_TOTAL_SYMS * SYMBOL_LEN);
     for i in 0..tone_samples {
-        let s = (2.0 * PI * TONE_HZ * i as f32 / FS).sin();
+        let s = (2.0 * PI * TONE_HZ * i as f32 / SAMPLE_RATE).sin();
         out.push(Complex32::new(s, 0.0));
     }
 
@@ -231,7 +231,7 @@ fn bits_to_u16(bits: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ofdm::{params::SYMBOL_LEN, zc::build_preamble};
+    use crate::ofdm::params::SYMBOL_LEN;
 
     #[test]
     fn beacon_encode_decode_loopback() {
@@ -244,7 +244,7 @@ mod tests {
 
         // Derive a channel estimate from ZC#1 (as the real RX would)
         use crate::ofdm::rx::sync::channel_estimate_from_zc;
-        use crate::ofdm::params::{CP_LEN, FFT_SIZE};
+        use crate::ofdm::params::CP_LEN;
         let zc1_fft = &beacon[zc_start + CP_LEN..zc_start + SYMBOL_LEN];
         let ch_est = channel_estimate_from_zc(zc1_fft);
 
