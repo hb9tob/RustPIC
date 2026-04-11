@@ -307,12 +307,15 @@ fn main() {
                 n_frames_seen += frame_stats.len();
 
                 match extract_payload(&result.payload) {
-                    Ok((name, data)) => {
+                    Ok((name, data, crc_ok)) => {
                         let path = unique_path(&cfg.outdir, &name);
                         match std::fs::write(&path, data) {
                             Ok(()) => {
-                                println!("  Saved     : {} ({} bytes)", path, data.len());
-                                n_files += 1;
+                                let crc_tag = if crc_ok { "CRC32 OK" } else { "CRC32 FAIL" };
+                                println!("  Saved     : {} ({} bytes, {})", path, data.len(), crc_tag);
+                                if crc_ok {
+                                    n_files += 1;
+                                }
                             }
                             Err(e) => eprintln!("  Write error: {path}: {e}"),
                         }
@@ -354,17 +357,71 @@ fn main() {
 
 // ── Payload helpers ───────────────────────────────────────────────────────────
 
-/// Decode payload: `[4 bytes: data_len] [1 byte: name_len] [name] [data]`
-fn extract_payload(p: &[u8]) -> Result<(String, &[u8]), String> {
-    if p.len() < 5 {
+/// Decodes the TX payload layout.
+///
+/// Layout:
+///
+/// ```text
+///   [META × 3]  [raw data bytes]  [4B trailing CRC32]
+/// ```
+///
+/// Each META block is 55 bytes:
+///
+/// ```text
+///   4B magic "RPIC"  4B data_len  1B name_len  40B name  4B data_crc32  2B crc16
+/// ```
+///
+/// Because three identical copies of META are spread across the
+/// FEC-protected payload (LDPC + RS + M-way byte interleave), even if a
+/// single RS group fails completely at least one copy normally survives —
+/// each copy is self-validated with a CRC-16 so we just pick the first
+/// one that passes.
+///
+/// Returns `Ok((filename, data_slice, full_crc_ok))`.
+fn extract_payload(p: &[u8]) -> Result<(String, &[u8], bool), String> {
+    const META_MAGIC: u32 = 0x52504943;
+    const META_LEN: usize  = 55;
+    const NAME_LEN_MAX: usize = 40;
+
+    if p.len() < META_LEN {
         return Err(format!("payload too short ({} bytes)", p.len()));
     }
-    let data_len = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
-    let name_len = p[4] as usize;
-    if p.len() < 5 + name_len {
-        return Err(format!("name_len={name_len} overruns payload ({} bytes)", p.len()));
+
+    // Parse a single META block.  Returns None if its internal CRC-16 fails
+    // or the magic word is wrong.
+    let parse_meta = |block: &[u8]| -> Option<(u32, u8, [u8; NAME_LEN_MAX], u32)> {
+        if block.len() < META_LEN { return None; }
+        // Verify CRC-16 on the first 53 bytes.
+        let crc_body   = &block[..53];
+        let crc_stored = u16::from_le_bytes([block[53], block[54]]);
+        if rustpic::ofdm::rx::mode_detect::crc16_ccitt(crc_body) != crc_stored {
+            return None;
+        }
+        let magic     = u32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+        if magic != META_MAGIC { return None; }
+        let data_len  = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        let name_len  = block[8];
+        let mut name_bytes = [0u8; NAME_LEN_MAX];
+        name_bytes.copy_from_slice(&block[9..9 + NAME_LEN_MAX]);
+        let data_crc32 = u32::from_le_bytes([block[49], block[50], block[51], block[52]]);
+        Some((data_len, name_len, name_bytes, data_crc32))
+    };
+
+    let mut chosen: Option<(u32, u8, [u8; NAME_LEN_MAX], u32)> = None;
+    for i in 0..3 {
+        let off = i * META_LEN;
+        if off + META_LEN > p.len() { break; }
+        if let Some(meta) = parse_meta(&p[off..off + META_LEN]) {
+            chosen = Some(meta);
+            break;
+        }
     }
-    let name = std::str::from_utf8(&p[5..5 + name_len])
+    let (data_len_u32, name_len, name_bytes, data_crc_expected) = chosen
+        .ok_or_else(|| "all 3 META copies failed CRC-16 check".to_string())?;
+
+    let data_len = data_len_u32 as usize;
+    let name_len = (name_len as usize).min(NAME_LEN_MAX);
+    let name = std::str::from_utf8(&name_bytes[..name_len])
         .unwrap_or("data")
         .to_string();
     // Sanitise: keep only the basename, replace path separators.
@@ -375,9 +432,33 @@ fn extract_payload(p: &[u8]) -> Result<(String, &[u8]), String> {
         .replace(['/', '\\', '\0'], "_");
     let name = if name.is_empty() { "data".to_string() } else { name };
 
-    let data_start = 5 + name_len;
-    let end = (data_start + data_len).min(p.len());
-    Ok((name, &p[data_start..end]))
+    let data_start = 3 * META_LEN;
+    let data_end   = data_start + data_len;
+    let crc_end    = data_end + 4;
+
+    if p.len() < data_end {
+        return Err(format!(
+            "data overruns payload: data_end={data_end} > p.len()={}",
+            p.len()
+        ));
+    }
+
+    let data = &p[data_start..data_end];
+
+    // Verify the trailing CRC-32 if present (authoritative full-payload check).
+    let trailing_ok = if p.len() >= crc_end {
+        let stored = u32::from_le_bytes([
+            p[data_end], p[data_end + 1], p[data_end + 2], p[data_end + 3],
+        ]);
+        rustpic::ofdm::rx::frame::crc32_ieee(&p[..data_end]) == stored
+    } else {
+        false
+    };
+
+    // Secondary check: the META's own CRC-32 over the raw data.
+    let data_crc_ok = rustpic::ofdm::rx::frame::crc32_ieee(data) == data_crc_expected;
+
+    Ok((name, data, trailing_ok && data_crc_ok))
 }
 
 /// Return a path that does not yet exist: `<dir>/<name>`, then `<dir>/<stem>_2.<ext>`, etc.

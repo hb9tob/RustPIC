@@ -82,12 +82,22 @@ pub struct EqualizedSymbol {
 ///
 /// [`set_timing_drift_per_sym`]: SymbolEqualizer::set_timing_drift_per_sym
 pub struct SymbolEqualizer {
-    /// Current channel estimate for **all** [`NUM_CARRIERS`] active subcarriers.
-    h: Vec<Complex32>,
-    /// EMA coefficient for pilot-based channel tracking (0 < α ≤ 1).
+    /// Reference channel estimate from the most recent ZC preamble / resync.
+    /// Holds the full per-carrier shape including any sharp features (HPF
+    /// phase, magnitude dips) that a sparse-pilot linear interpolator could
+    /// not reconstruct from pilots alone. Only rewritten by `resync_from_zc`.
+    h_ref: Vec<Complex32>,
+    /// EMA-smoothed multiplicative correction factor, one value per pilot.
+    /// Nominally 1 + 0j after a fresh ZC — tracks slow drift (CPE, soundcard
+    /// clock mismatch, oscillator wander) between the ZC and the current
+    /// symbol. Pilots measure `correction = y[pilot]/expected / h_ref[pilot]`
+    /// which is nearly uniform across the band, so *linear interpolation of
+    /// the correction* is accurate even when `h_ref` itself has > 100° of
+    /// phase rotation between adjacent pilots.
+    pilot_corr: Vec<Complex32>,
+    /// EMA coefficient for the pilot correction factor (0 < α ≤ 1).
     alpha: f32,
     /// Estimated per-data-symbol timing drift in samples (positive = late read).
-    /// Set from consecutive resync ZC positions; 0.0 until first resync.
     timing_drift_per_sym: f32,
     /// Count of data symbols processed since the last ZC reset.
     syms_since_resync: usize,
@@ -103,7 +113,8 @@ impl SymbolEqualizer {
     pub fn from_preamble(h_preamble: &[Complex32], alpha: f32) -> Self {
         assert_eq!(h_preamble.len(), NUM_CARRIERS);
         Self {
-            h: h_preamble.to_vec(),
+            h_ref: h_preamble.to_vec(),
+            pilot_corr: vec![Complex32::new(1.0, 0.0); NUM_PILOTS],
             alpha: alpha.clamp(1e-4, 1.0),
             timing_drift_per_sym: 0.0,
             syms_since_resync: 0,
@@ -124,12 +135,14 @@ impl SymbolEqualizer {
 
     /// Re-estimates the channel from a re-sync ZC OFDM symbol (CP included).
     ///
-    /// Fully replaces the current channel estimate (no EMA blending) and resets
-    /// the intra-group symbol counter used for drift pre-correction.
+    /// Fully replaces the reference channel (no EMA blending), resets the
+    /// pilot correction factor to unity, and zeroes the intra-group symbol
+    /// counter used for drift pre-correction.
     pub fn resync_from_zc(&mut self, ofdm_symbol: &[Complex32]) {
         assert_eq!(ofdm_symbol.len(), SYMBOL_LEN);
         let fft_window = &ofdm_symbol[CP_LEN..];
-        self.h = channel_estimate_from_zc(fft_window);
+        self.h_ref = channel_estimate_from_zc(fft_window);
+        self.pilot_corr.fill(Complex32::new(1.0, 0.0));
         self.syms_since_resync = 0;
     }
 
@@ -137,11 +150,32 @@ impl SymbolEqualizer {
 
     /// Equalises one data OFDM symbol (CP included).
     ///
+    /// # Algorithm — reference-based pilot tracking
+    ///
+    /// The ZC preamble has already given us a full per-carrier reference
+    /// `h_ref[k]`, which captures every sharp feature of the channel
+    /// (magnitude dips, fast phase rotations at band edges, etc.) with
+    /// unit-subcarrier resolution. Between ZC events the real channel
+    /// only *drifts slowly* from that reference — mostly a common phase
+    /// rotation from the TX/RX oscillator mismatch.
+    ///
+    /// Instead of re-deriving `H[k]` from 6 pilots every symbol (which
+    /// collapses to a linear interpolation that cannot follow > 100° of
+    /// phase in one pilot spacing), we measure the per-pilot correction
+    /// factor `c[p] = (y[k]/expected) / h_ref[k]`, EMA-smooth it, linearly
+    /// interpolate it across all carriers (linear is accurate because `c[k]`
+    /// is nearly uniform) and apply it multiplicatively to the ZC reference:
+    ///
+    /// ```text
+    ///   h_eff[k] = h_ref[k] × linear_interp(c[pilots])[k]
+    /// ```
+    ///
     /// # Steps
     /// 1. Strip CP, FFT, scale → Y[k].
-    /// 2. At pilot positions: measure H_measured[k], apply EMA update, compute residuals.
-    /// 3. Interpolate H[k] to all positions.
-    /// 4. ZF-equalise data subcarriers, compute per-carrier noise variance.
+    /// 2. Pre-rotate for clock drift and common phase error.
+    /// 3. At each pilot: compute raw correction factor, EMA-smooth it.
+    /// 4. Interpolate the correction factor to all carriers (linear).
+    /// 5. `h_eff[k] = h_ref[k] * corr[k]`, ZF-equalize data subcarriers.
     pub fn process(&mut self, ofdm_symbol: &[Complex32]) -> EqualizedSymbol {
         assert_eq!(ofdm_symbol.len(), SYMBOL_LEN);
 
@@ -150,14 +184,6 @@ impl SymbolEqualizer {
         let mut y = ofdm_demodulate(fft_window); // NUM_CARRIERS complex values
 
         // ── 1b. Clock-drift phase pre-correction ─────────────────────────────
-        // A timing error of `d` samples shifts each subcarrier at FFT bin `b` by
-        //   Y[k] = H_true[k] · X[k] · exp(+j·2π·d·b / FFT_SIZE)
-        // We remove this rotation before the pilot EMA so the EMA only needs to
-        // track residual channel changes rather than the growing phase ramp.
-        //
-        // d = (syms_since_resync + 1) × timing_drift_per_sym
-        //   (the +1 accounts for one symbol-period between the ZC and the first
-        //    data symbol after reset)
         let drift_samples = (self.syms_since_resync as f32 + 1.0) * self.timing_drift_per_sym;
         if drift_samples.abs() > 1e-9 {
             use std::f32::consts::PI;
@@ -165,36 +191,27 @@ impl SymbolEqualizer {
                 let phi = 2.0 * PI * drift_samples * carrier_to_bin(k) as f32
                           / FFT_SIZE as f32;
                 let (sin_phi, cos_phi) = phi.sin_cos();
-                // multiply by exp(−j·phi) = cos(phi) − j·sin(phi)
                 y[k] *= Complex32::new(cos_phi, -sin_phi);
             }
         }
         self.syms_since_resync += 1;
 
-        // ── 1c. Common Phase Error (CPE) correction ──────────────────────────
-        // FM oscillator phase noise rotates ALL subcarriers by the same angle
-        // every symbol. Estimate the common rotation from pilots vs the current
-        // channel estimate, then remove it before the EMA update so the EMA
-        // only tracks slow frequency-selective fading.
-        //
-        //   CPE = arg( Σ_p  (Y[pilot_k] / expected_p)  ×  conj(H_ema[pilot_k]) )
-        //
-        // Summing the complex products (instead of averaging angles) avoids
-        // wrap-around artefacts when individual pilot estimates are noisy.
+        // ── 1c. Common Phase Error (CPE) removal ─────────────────────────────
+        // Estimate and strip the global per-symbol phase rotation so the
+        // pilot-correction EMA only sees slow multiplicative drift.  Rotation
+        // is estimated against the *current* effective channel (reference ×
+        // correction), not against h_ref alone, so the residue is near zero.
         let cpe: f32 = {
             let sum: Complex32 = (0..NUM_PILOTS)
                 .map(|p| {
                     let k      = p * PILOT_SPACING;
                     let h_meas = y[k] / Complex32::new(pilot_sign(k), 0.0);
-                    h_meas * self.h[k].conj()
+                    let h_exp  = self.h_ref[k] * self.pilot_corr[p];
+                    h_meas * h_exp.conj()
                 })
                 .fold(Complex32::new(0.0, 0.0), |acc, v| acc + v);
-            sum.arg() // radians in (−π, +π]
+            sum.arg()
         };
-        // Rotate the whole symbol by −CPE so EMA sees only channel variation.
-        // Threshold: skip correction when |CPE| < 0.1 rad (≈ 6°) — below this
-        // the estimate is dominated by pilot noise and the correction degrades
-        // performance rather than improving it.
         if cpe.abs() > 0.1 {
             let corr = Complex32::from_polar(1.0, -cpe);
             for k in 0..NUM_CARRIERS {
@@ -202,57 +219,64 @@ impl SymbolEqualizer {
             }
         }
 
-        // ── 2. Pilot observation & EMA update ────────────────────────────────
-        // pilot_h[p] = channel at the p-th pilot subcarrier (p = 0..NUM_PILOTS)
-        let mut pilot_h    = Vec::with_capacity(NUM_PILOTS);
-        let mut pilot_err2 = 0.0f32; // sum of squared pilot residuals (post-EQ)
+        // ── 2. Pilot correction measurement and EMA update ───────────────────
+        // For each pilot:
+        //   h_measured[p] = y[pilot_k] / expected_sign
+        //   c_measured[p] = h_measured[p] / h_ref[pilot_k]     (~ 1 + 0j)
+        //   EMA: c[p] ← (1−α)·c[p] + α·c_measured[p]
+        //
+        // In deep fades the ZC reference can have |h_ref| ≈ 0 at one pilot,
+        // in which case the division is ill-conditioned — we clamp to the
+        // previous EMA value and flag the pilot as weak.
+        let mut pilot_err2 = 0.0_f32;
 
         for p in 0..NUM_PILOTS {
-            let k = p * PILOT_SPACING; // active-carrier index
-            let expected = pilot_sign(p * PILOT_SPACING); // ±1 BPSK reference
+            let k = p * PILOT_SPACING;
+            let expected = Complex32::new(pilot_sign(k), 0.0);
 
-            // Channel at this pilot from received signal
-            let h_measured = y[k] / Complex32::new(expected, 0.0);
+            let y_over_exp = y[k] / expected;
+            let h_ref_p    = self.h_ref[k];
+            let h_ref_sq   = h_ref_p.norm_sqr();
 
-            // EMA update
-            self.h[k] = self.h[k] * (1.0 - self.alpha)
-                      + h_measured * self.alpha;
-            pilot_h.push(self.h[k]);
+            if h_ref_sq > 1e-10 {
+                // c_measured = y_over_exp / h_ref_p = y_over_exp * conj(h_ref_p) / |h_ref_p|²
+                let c_meas = y_over_exp * h_ref_p.conj() / h_ref_sq;
+                self.pilot_corr[p] = self.pilot_corr[p] * (1.0 - self.alpha)
+                                   + c_meas * self.alpha;
+            }
+            // else: keep previous correction factor — the pilot is in a fade.
 
-            // Equalized pilot residual (after EMA update)
-            let equalized_pilot = y[k] * zf(self.h[k]);
-            let error = equalized_pilot - Complex32::new(expected, 0.0);
-            pilot_err2 += error.norm_sqr();
+            // Pilot residual: after applying the EMA-updated h_eff, how far
+            // are we from the nominal expected value?
+            let h_eff_p      = self.h_ref[k] * self.pilot_corr[p];
+            let equalized    = y[k] * zf(h_eff_p);
+            let err          = equalized - expected;
+            pilot_err2      += err.norm_sqr();
         }
 
         let mean_pilot_err2 = pilot_err2 / NUM_PILOTS as f32;
         let pilot_snr_db    = -10.0 * mean_pilot_err2.max(1e-10).log10();
 
-        // ── 3. Channel interpolation for all active subcarriers ───────────────
-        let h_interp = interpolate(&pilot_h);
+        // ── 3. Linear interpolation of the correction across all carriers ────
+        // `pilot_corr` is smooth (nominally all values near 1+0j) so linear
+        // interpolation in Cartesian coordinates is accurate even though
+        // `h_ref` itself may have 100°+ phase jumps between pilots.
+        let corr_interp = interpolate(&self.pilot_corr);
 
-        // Update non-pilot positions in the stored channel estimate
-        for k in 0..NUM_CARRIERS {
-            if !is_pilot(k) {
-                self.h[k] = h_interp[k];
-            }
-        }
-
-        // ── 4. ZF equalization — data subcarriers only ────────────────────────
-        // FM discriminator noise PSD ∝ f² → noise variance at subcarrier k is
-        //   σ²[k] = σ²_ref × (bin_k / bin_ref)²  / |H[k]|²
+        // ── 4. Effective channel and ZF equalisation ─────────────────────────
+        // h_eff[k] = h_ref[k] × corr[k]
         //
-        // σ²_channel is estimated from pilot residuals, averaged over all pilots.
-        // The pilots span bins {FIRST_BIN, …, FIRST_BIN+64}, so sigma2_channel
-        // ≈ α_FM × mean(bin_pilot²) where α_FM is the FM noise coefficient.
-        // Dividing by mean_pilot_bin² recovers α_FM; multiplying by bin_k² gives
-        // the correct per-carrier noise variance.
-        //
-        // This re-weighting makes LDPC LLRs reliable: low-frequency subcarriers
-        // (small bin, quiet) get tight LLRs; high-frequency (noisy) get wide LLRs.
-        let sigma2_channel = mean_pilot_err2
-            * pilot_h.iter().map(|h| h.norm_sqr()).sum::<f32>()
-            / NUM_PILOTS as f32;
+        // Average signal power over pilots (used to scale the noise variance
+        // so the LLRs stay in a reasonable range after the ±20 clipping in
+        // the demapper).
+        let mean_h2: f32 = (0..NUM_PILOTS)
+            .map(|p| {
+                let k     = p * PILOT_SPACING;
+                let h_eff = self.h_ref[k] * self.pilot_corr[p];
+                h_eff.norm_sqr()
+            })
+            .sum::<f32>() / NUM_PILOTS as f32;
+        let sigma2_channel = mean_pilot_err2 * mean_h2;
 
         let mut data      = Vec::with_capacity(NUM_DATA);
         let mut noise_var = Vec::with_capacity(NUM_DATA);
@@ -261,13 +285,10 @@ impl SymbolEqualizer {
             if is_pilot(k) {
                 continue;
             }
-            let h_k  = h_interp[k];
-            let h_sq = h_k.norm_sqr();
+            let h_eff = self.h_ref[k] * corr_interp[k];
+            let h_sq  = h_eff.norm_sqr();
 
-            // ZF equalize
-            data.push(y[k] * zf(h_k));
-
-            // Per-carrier noise variance
+            data.push(y[k] * zf(h_eff));
             noise_var.push(sigma2_channel / h_sq.max(1e-6));
         }
 
@@ -444,11 +465,11 @@ mod tests {
 
         // Verify resync doesn't panic and updates h
         eq.resync_from_zc(&preamble);
-        // After resync on the same preamble, H should be close to the original
+        // After resync on the same preamble, h_ref should be close to the original
         for k in 0..NUM_CARRIERS {
             assert!(
-                (eq.h[k] - h0[k]).norm() < 1e-3,
-                "H[{k}] diverged after resync"
+                (eq.h_ref[k] - h0[k]).norm() < 1e-3,
+                "h_ref[{k}] diverged after resync"
             );
         }
     }

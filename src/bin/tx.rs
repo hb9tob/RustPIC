@@ -25,8 +25,8 @@ use rustpic::{
         beacon::build_beacon,
         params::{CP_LEN, FFT_SIZE, SAMPLE_RATE, SYMBOL_LEN},
         rx::{
-            frame::max_packets_per_frame,
-            mode_detect::{LdpcRate, Modulation},
+            frame::{crc32_ieee, max_packets_per_frame},
+            mode_detect::{crc16_ccitt, LdpcRate, Modulation},
         },
         tx::frame::{build_transmission, FrameConfig},
     },
@@ -63,7 +63,7 @@ impl Default for Cfg {
             gain_db:    0.0,
             deemph_tau: None,
             bandpass:   false,
-            smooth_tw:  32,
+            smooth_tw:  0,
         }
     }
 }
@@ -191,18 +191,66 @@ fn main() {
     let raw = std::fs::read(&cfg.input)
         .unwrap_or_else(|e| die(&format!("cannot read '{}': {e}", cfg.input)));
 
-    // Payload header: [4 bytes: data_len LE] [1 byte: name_len] [name bytes] [data bytes]
+    // Payload layout — defence in depth:
+    //
+    //   [META × 3]  [raw data bytes]  [4B trailing CRC32]
+    //
+    // META is a fixed 64-byte block that carries the critical metadata
+    // (magic, data_len, filename, data_crc32).  It is repeated 3 times at
+    // the start of the payload so that even if a whole RS group fails on
+    // the RX side, at least one META copy survives somewhere in the
+    // M-interleaved bytes.  Each copy has its own internal CRC-16 so the
+    // RX can pick the first valid copy without needing majority vote.
+    //
+    // The trailing CRC-32 covers everything (all three META blocks + the
+    // data) and is the authoritative full-payload integrity check.
+    //
+    // All of this sits INSIDE the LDPC + RS + M-interleave chain, so the
+    // effective protection is the same as the user-selected LDPC rate on
+    // the data bytes — but the triple-META layout makes the single point
+    // of failure (losing the filename / data_len / data_crc32) disappear.
+    const META_MAGIC: u32 = 0x52504943; // "RPIC"
+    const META_NAME_BYTES: usize = 40;   // fixed-size name field
+    const META_LEN: usize = 4 + 4 + 1 + META_NAME_BYTES + 4 + 2; // 55 bytes
+    let _ = META_LEN;
+
     let name = std::path::Path::new(&cfg.input)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("data");
     let name_bytes = name.as_bytes();
-    let name_len   = name_bytes.len().min(255) as u8;
-    let mut payload = Vec::with_capacity(5 + name_len as usize + raw.len());
-    payload.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-    payload.push(name_len);
-    payload.extend_from_slice(&name_bytes[..name_len as usize]);
+    let name_len   = name_bytes.len().min(META_NAME_BYTES) as u8;
+    let data_crc32 = crc32_ieee(&raw);
+
+    // Build a single META block (55 bytes) with its own CRC-16.
+    let build_meta = || -> Vec<u8> {
+        let mut m = Vec::with_capacity(55);
+        m.extend_from_slice(&META_MAGIC.to_le_bytes());          // 4
+        m.extend_from_slice(&(raw.len() as u32).to_le_bytes());  // 4
+        m.push(name_len);                                         // 1
+        let mut padded_name = [0u8; META_NAME_BYTES];
+        padded_name[..name_len as usize].copy_from_slice(&name_bytes[..name_len as usize]);
+        m.extend_from_slice(&padded_name);                        // 40
+        m.extend_from_slice(&data_crc32.to_le_bytes());           // 4
+        // Internal CRC-16/CCITT over the preceding 53 bytes.
+        let crc16 = crc16_ccitt(&m);
+        m.extend_from_slice(&crc16.to_le_bytes());                // 2
+        m
+    };
+
+    let meta_block = build_meta();
+    assert_eq!(meta_block.len(), 55);
+
+    let mut payload = Vec::with_capacity(3 * 55 + raw.len() + 4);
+    // Three copies of META.
+    for _ in 0..3 {
+        payload.extend_from_slice(&meta_block);
+    }
+    // The raw user data.
     payload.extend_from_slice(&raw);
+    // Authoritative trailing CRC-32 over everything above.
+    let trailing_crc = crc32_ieee(&payload);
+    payload.extend_from_slice(&trailing_crc.to_le_bytes());
     let payload = payload;
 
     let frame_cfg = FrameConfig {
