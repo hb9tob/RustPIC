@@ -1,7 +1,7 @@
 //! Mode header decoder.
 //!
 //! The **mode header** is the OFDM symbol immediately following the two ZC
-//! preambles.  All [`NUM_CARRIERS`] = 47 active subcarriers carry BPSK symbols
+//! preambles.  All [`NUM_CARRIERS`] = 42 active subcarriers carry BPSK symbols
 //! that encode the transmission parameters for the super-frame.
 //!
 //! # Bit layout  (47 BPSK symbols = 47 bits)
@@ -298,7 +298,7 @@ pub fn decode_mode_header(
         .map(|(&y, &h)| zf_equalise(y, h))
         .collect();
 
-    // ── BPSK hard decisions → 47 bits ────────────────────────────────────────
+    // ── BPSK hard decisions → 42 bits ────────────────────────────────────────
     let bits: Vec<u8> = equalized.iter()
         .map(|c| u8::from(c.re >= 0.0))
         .collect(); // 0 or 1, MSB at index 0
@@ -310,7 +310,7 @@ pub fn decode_mode_header(
     let has_resync         = bits[7] == 1;
     let total_packet_count = bits_to_u16(&bits[8..20]);   // 12-bit field (max 4095)
     let packet_offset      = bits_to_u16(&bits[20..32]);  // 12-bit field (max 4095)
-    let crc_received       = bits_to_u16(&bits[32..47]);  // lower 15 bits of CRC-16
+    let crc_received       = bits_to_u16(&bits[32..42]);  // 10-bit CRC (low 10 of CRC-16)
 
     let modulation = Modulation::from_u8(modulation_code)
         .ok_or(ModeError::InvalidModulation(modulation_code))?;
@@ -319,9 +319,9 @@ pub fn decode_mode_header(
     let rs_level = RsLevel::from_u8(rs_level_code)
         .ok_or(ModeError::InvalidRsLevel(rs_level_code))?;
 
-    // ── CRC-15: lower 15 bits of CRC-16/CCITT over bits 0–31 ─────────────────
+    // ── CRC-10: lower 10 bits of CRC-16/CCITT over bits 0–31 ─────────────────
     let payload_bytes = bits_to_bytes(&bits[0..32]);
-    let crc_computed  = crc16_ccitt(&payload_bytes) & 0x7FFF;
+    let crc_computed  = crc16_ccitt(&payload_bytes) & 0x03FF;
     let crc_ok        = crc_computed == crc_received;
 
     if !crc_ok {
@@ -391,8 +391,8 @@ pub fn encode_mode_header(hdr: &ModeHeader) -> Vec<f32> {
 
     // CRC-15: lower 15 bits of CRC-16/CCITT over first 4 bytes (bits 0–31)
     let payload_bytes = bits_to_bytes(&bits[0..32]);
-    let crc = crc16_ccitt(&payload_bytes) & 0x7FFF;
-    pack_bits(&mut bits[32..47], crc, 15);
+    let crc = crc16_ccitt(&payload_bytes) & 0x03FF;
+    pack_bits(&mut bits[32..42], crc, 10);
 
     // Map 0 → −1, 1 → +1
     bits.iter().map(|&b| if b == 1 { 1.0f32 } else { -1.0f32 }).collect()

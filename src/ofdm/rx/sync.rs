@@ -144,9 +144,16 @@ impl ZcCorrelator {
     /// * `threshold` – primary detection gate (typical: 0.40 … 0.55).
     /// * `confirm_threshold` – second ZC gate (typical: 0.30 … 0.45).
     pub fn new(threshold: f32, confirm_threshold: f32) -> Self {
-        let preamble = build_preamble();
-        let ref_energy = energy(&preamble);
-        let preamble_conj = preamble.into_iter().map(|s| s.conj()).collect();
+        // We transmit only the real part of the ZC preamble (audio is real),
+        // so we match against the real part only.  This makes the normalised
+        // correlation reach 1.0 on a perfect loopback instead of ~0.71, and
+        // gives the best sensitivity on a real FM channel.
+        let preamble_re: Vec<Complex32> = build_preamble()
+            .into_iter()
+            .map(|s| Complex32::new(s.re, 0.0))
+            .collect();
+        let ref_energy    = energy(&preamble_re);
+        let preamble_conj = preamble_re.iter().map(|s| s.conj()).collect();
         Self { preamble_conj, ref_energy, threshold, confirm_threshold }
     }
 
@@ -175,26 +182,76 @@ impl ZcCorrelator {
             });
         }
 
-        // ── Stage 2: confirmation — second ZC at best_pos + SYMBOL_LEN ───────
-        let mut zc2_start      = best_pos + SYMBOL_LEN;
-        let mut confirm_metric = self.single_metric(&samples[zc2_start..zc2_start + SYMBOL_LEN]);
+        // ── Stage 2: confirmation — search ±ZC2_SEARCH_RADIUS around ZC2 nominal ─
+        //
+        // The confirmation window allows for timing uncertainty introduced by
+        // the FM channel (phase distortion, de-emphasis) which can shift the
+        // correlation peak by up to a few hundred samples from the nominal
+        // ZC1 + SYMBOL_LEN position.
+        const ZC2_SEARCH_RADIUS: usize = 256;
         let mut best_pos       = best_pos;
         let mut best_metric    = best_metric;
+        let mut zc2_start;
+        let mut confirm_metric;
+
+        // Search ZC2 in [best_pos+SYMBOL_LEN-R, best_pos+SYMBOL_LEN+R].
+        {
+            let nom        = best_pos + SYMBOL_LEN;
+            let search_lo  = nom.saturating_sub(ZC2_SEARCH_RADIUS);
+            let search_hi  = (nom + ZC2_SEARCH_RADIUS + 1)
+                                 .min(samples.len().saturating_sub(SYMBOL_LEN));
+            let (best_off, best_m2) = (search_lo..search_hi)
+                .map(|d| (d, self.single_metric(&samples[d..d + SYMBOL_LEN])))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap_or((nom, 0.0));
+            zc2_start      = best_off;
+            confirm_metric = best_m2;
+        }
 
         // With two identical preamble ZC symbols, the global peak can land on
-        // ZC#2 instead of ZC#1 (they have equal SNR).  If confirmation fails,
-        // check whether `best_pos − SYMBOL_LEN` is ZC#1 (with ZC#2 as its
-        // confirmation).
-        if confirm_metric < self.confirm_threshold && best_pos >= SYMBOL_LEN {
-            let alt_pos    = best_pos - SYMBOL_LEN;
-            let alt_metric = self.single_metric(&samples[alt_pos..alt_pos + SYMBOL_LEN]);
-            // The original best_pos IS ZC#2 → its correlation is the confirmation metric
+        // ZC#2 instead of ZC#1.  **Always** try the swap-back interpretation
+        // (treat best_pos as ZC#2 and look for ZC#1 one symbol earlier) and
+        // keep whichever interpretation gives the higher confirm metric.  The
+        // previous fallback only fired when `confirm_metric < confirm_threshold`,
+        // which missed cases where a random mode-header correlation sits in
+        // [confirm_threshold, 0.5] — the sync would return pointing at ZC#2
+        // and the frame decode would then garbage-process the wrong symbols.
+        if best_pos >= SYMBOL_LEN {
+            let nom2       = best_pos - SYMBOL_LEN;
+            let search_lo2 = nom2.saturating_sub(ZC2_SEARCH_RADIUS);
+            let search_hi2 = (nom2 + ZC2_SEARCH_RADIUS + 1)
+                                 .min(samples.len().saturating_sub(SYMBOL_LEN));
+            let (alt_pos, alt_metric) = (search_lo2..search_hi2)
+                .map(|d| (d, self.single_metric(&samples[d..d + SYMBOL_LEN])))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap_or((nom2, 0.0));
+
+            // The swap interpretation measures its own confirm metric at
+            // alt_pos + SYMBOL_LEN — that is simply `best_metric`, the
+            // correlation already found at the original global peak.
             let alt_confirm = best_metric;
-            if alt_metric >= self.threshold && alt_confirm >= self.confirm_threshold {
+
+            // Pick the interpretation with the larger geometric-mean metric.
+            // Both must pass the primary threshold on ZC#1.
+            let current_score = best_metric.min(confirm_metric);
+            let alt_score     = alt_metric.min(alt_confirm);
+            if alt_metric >= self.threshold && alt_score > current_score {
                 best_pos       = alt_pos;
                 best_metric    = alt_metric;
                 zc2_start      = best_pos + SYMBOL_LEN;
                 confirm_metric = alt_confirm;
+                // Refine ZC2 position with a search around the nominal.
+                let nom3 = best_pos + SYMBOL_LEN;
+                let lo3  = nom3.saturating_sub(ZC2_SEARCH_RADIUS);
+                let hi3  = (nom3 + ZC2_SEARCH_RADIUS + 1)
+                             .min(samples.len().saturating_sub(SYMBOL_LEN));
+                if let Some((zc2s, m2)) = (lo3..hi3)
+                    .map(|d| (d, self.single_metric(&samples[d..d + SYMBOL_LEN])))
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                {
+                    zc2_start      = zc2s;
+                    confirm_metric = m2;
+                }
             }
         }
 
@@ -354,7 +411,9 @@ pub fn find_resync_zc(
     let search_end   = (expected_pos + radius + 1)
                            .min(samples.len().saturating_sub(SYMBOL_LEN));
 
-    // Build ZC reference in time domain (CP-stripped, length FFT_SIZE)
+    // Build ZC reference in time domain (CP-stripped, length FFT_SIZE).
+    // Use only the real part — we transmit Re(ZC), so this is the correct
+    // matched filter.
     let zc_ref: Vec<Complex32> = {
         let zc_freq = zc_freq_reference();
         let mut freq_buf = vec![Complex32::new(0.0, 0.0); FFT_SIZE];
@@ -364,7 +423,7 @@ pub fn find_resync_zc(
         let mut planner = FftPlanner::<f32>::new();
         planner.plan_fft_inverse(FFT_SIZE).process(&mut freq_buf);
         let scale = 1.0 / (FFT_SIZE as f32).sqrt();
-        freq_buf.iter().map(|s| s * scale).collect()
+        freq_buf.iter().map(|s| Complex32::new(s.re * scale, 0.0)).collect()
     };
 
     let ref_energy: f32 = zc_ref.iter().map(|s| s.norm_sqr()).sum::<f32>().sqrt();
@@ -458,13 +517,19 @@ mod tests {
 
     /// In an AWGN-free channel the correlator must find sync at offset 0
     /// with metric ≈ 1.
+    ///
+    /// The received signal is the real part of the preamble (as transmitted over
+    /// audio with Im = 0), matching the real-part template in the correlator.
     #[test]
     fn perfect_channel_sync() {
-        // Build a buffer: ZC#1, ZC#2, dummy header (zeros)
-        let preamble = build_preamble();
+        // Simulate the actual received signal: Re(preamble) with Im = 0.
+        let preamble_re: Vec<Complex32> = build_preamble()
+            .into_iter()
+            .map(|s| Complex32::new(s.re, 0.0))
+            .collect();
         let mut samples: Vec<Complex32> = Vec::new();
-        samples.extend_from_slice(&preamble); // ZC#1
-        samples.extend_from_slice(&preamble); // ZC#2
+        samples.extend_from_slice(&preamble_re); // ZC#1
+        samples.extend_from_slice(&preamble_re); // ZC#2
         samples.extend(std::iter::repeat(Complex32::new(0.0, 0.0)).take(SYMBOL_LEN)); // hdr
 
         let corr = ZcCorrelator::new(0.40, 0.30);
@@ -479,13 +544,14 @@ mod tests {
     /// preamble start.
     #[test]
     fn sync_with_timing_offset() {
-        let preamble = build_preamble();
-        let offset   = 137usize;
+        let preamble_re: Vec<Complex32> = build_preamble()
+            .into_iter().map(|s| Complex32::new(s.re, 0.0)).collect();
+        let offset = 137usize;
 
         let mut samples: Vec<Complex32> =
-            vec![Complex32::new(0.0, 0.0); offset];        // leading guard
-        samples.extend_from_slice(&preamble);              // ZC#1
-        samples.extend_from_slice(&preamble);              // ZC#2
+            vec![Complex32::new(0.0, 0.0); offset];           // leading guard
+        samples.extend_from_slice(&preamble_re);              // ZC#1
+        samples.extend_from_slice(&preamble_re);              // ZC#2
         samples.extend(
             std::iter::repeat(Complex32::new(0.0, 0.0)).take(SYMBOL_LEN));
 

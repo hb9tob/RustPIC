@@ -82,25 +82,33 @@ jobs:
           body: |
             ## RustPIC ${{ github.ref_name }}
 
-            Binaires autonomes — aucune installation requise.
+            Standalone binaries — no installation required.
 
-            | Fichier | Plateforme |
-            |---------|-----------|
+            | File | Platform |
+            |------|----------|
             | `tx.exe` / `rx.exe` | Windows 64-bit |
-            | `tx-linux-x86_64` / `rx-linux-x86_64` | Linux 64-bit (statique, musl) |
+            | `tx-linux-x86_64` / `rx-linux-x86_64` | Linux 64-bit (static, musl) |
 
-            ### Utilisation
+            ### Usage
 
-            **Encoder un fichier en WAV (obligatoire: indicatif) :**
+            **Encode a file into a WAV (callsign is required):**
             ```
             tx --input photo.jpg --output photo.wav --callsign HB9TOB --mod 16qam --rate 3/4
             ```
-            Re-sync ZC is **on by default** — add `--no-resync` only if you need the smallest possible file size.
+            Re-sync ZC is **on by default** — add `--no-resync` only if you need the
+            smallest possible file size.
 
-            **Décoder un WAV — tous les fichiers trouvés sont extraits :**
+            **Decode a WAV — every transmission found inside is written out:**
             ```
-            rx --input enregistrement.wav --outdir .
+            rx --input recording.wav --outdir .
             ```
 
-            Le beacon de 612 ms en début de transmission active le VOX et transmet
-            l'indicatif, le nom de fichier et le mode avant les données.
+            A short beacon at the start of each transmission activates VOX and sends
+            the callsign, file name and mode before the data begins.
+
+            ### OFDM parameters
+
+            - Sample rate: 48 kHz (native, no resampling)
+            - FFT: 1024, CP: 256, symbol period: 26.67 ms
+            - **42 active subcarriers**, spacing **46.875 Hz**
+            - Band: **562.5 – 2484.4 Hz** (pilot 0 above the NBFM audio HPF corner)

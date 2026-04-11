@@ -20,27 +20,56 @@ Image → WebP encode → payload bytes
      LDPC (1/2…5/6)        inner FEC — adaptive rate per link SNR, IEEE 802.11n z=81 (n=1944)
            │
            ▼
-     OFDM modulator        FFT=256, CP=32, fs=8 kHz, 72 subcarriers (312–2531 Hz)
+     G3RUH scrambler       17-bit LFSR, seed 0x1FFFF
            │
            ▼
-     FM transmitter        via Hamlib CAT+PTT, software FM pre-emphasis 50 µs
+     OFDM modulator        FFT=1024, CP=256, fs=48 kHz, 42 subcarriers (562–2484 Hz)
+           │                Δf = 46.875 Hz, symbol period 26.67 ms
+           ▼
+     FM transmitter        audio-in to any NBFM transceiver (VHF/UHF voice repeaters)
 ```
 
 ### Super-frame structure
 
 ```
 ┌──────┬──────┬────────┬─ data ──┬── re-sync ──┬─ data ──┬─────┐
-│ ZC#1 │ ZC#2 │ header │ D×12   │ ZC (resync) │ D×…    │ EOT │
+│ ZC#1 │ ZC#2 │ header │ D×12    │ ZC (resync) │ D×…     │ EOT │
 └──────┴──────┴────────┴─────────┴─────────────┴─────────┴─────┘
 ```
 
 | Field | Details |
 |---|---|
-| Preamble | Two identical Zadoff–Chu symbols (ZC_ROOT=25, SYMBOL_LEN=288) |
-| Mode header | BPSK + CRC-16/CCITT, 32-bit diversity repeat — encodes modulation, LDPC rate, RS level, packet count/offset |
-| Data symbols | BPSK / QPSK / 16-QAM / 32-QAM / 64-QAM — 63 data + 9 pilot subcarriers per symbol |
-| Re-sync ZC | Optional, inserted every 12 data symbols — maintains timing over long frames |
+| Preamble | Two identical Zadoff–Chu symbols (`ZC_ROOT=25`, `ZC_LEN=42`), one `SYMBOL_LEN=1280` each |
+| Mode header | 42 BPSK symbols + 10-bit CRC — encodes modulation, LDPC rate, RS level, packet count/offset |
+| Data symbols | BPSK / QPSK / 16-QAM / 32-QAM / 64-QAM — 36 data + 6 pilot subcarriers per symbol |
+| Re-sync ZC | On by default, inserted every 12 data symbols — maintains timing over long frames |
 | EOT | CRC-32/IEEE-802.3 of the payload in the first 32 data subcarriers (BPSK) |
+
+### OFDM parameters
+
+RustPIC mirrors the ETSI DRM Mode B timing at native 48 kHz, with a narrower
+active band tuned for NBFM voice repeaters.
+
+| Parameter | Value |
+|---|---|
+| Sample rate (`SAMPLE_RATE`) | **48 000 Hz** (native, no resampling) |
+| FFT size (`FFT_SIZE`) | 1024 |
+| Cyclic prefix (`CP_LEN`) | 256 samples |
+| Symbol length (`SYMBOL_LEN`) | 1280 samples = **26.67 ms** |
+| Subcarrier spacing (`Δf`) | **46.875 Hz** (= 48 000 / 1024) |
+| **Active subcarriers** | **42** (`NUM_CARRIERS`, bins 12…53) |
+| Pilot subcarriers | 6 (active indices 0, 8, 16, 24, 32, 40) |
+| Data subcarriers | 36 per OFDM symbol |
+| First active carrier | **562.5 Hz** (`FIRST_BIN = 12`) |
+| Last active carrier  | **2484.4 Hz** (`LAST_BIN = 53`) |
+| Audio bandwidth | 1.9 kHz |
+
+`FIRST_BIN = 12` keeps pilot 0 above the phase-non-linear region of a typical
+NBFM radio's microphone-input high-pass filter (≈ 300 Hz corner). On early
+on-the-air tests starting at 328 Hz, the pilot-based linear interpolation
+could not track the HPF's phase rotation (up to −127°/carrier in the first
+few bins) and lost roughly 5 % raw BER to misdecoded low carriers. Starting
+at 562.5 Hz places every pilot in the channel's linear-delay region.
 
 Large payloads are split across multiple super-frames. The mode header carries a 12-bit
 `packet_offset` field so the receiver can reassemble them in order (max 4095 RS packets ≈ 760 KB).
@@ -86,29 +115,22 @@ can be declared failed and still recovered; bpg=6 (R5/6 L1) allows 16.7%.
 | 32-QAM | 5 | ~15 dB | Good links |
 | 64-QAM | 6 | ~21 dB | Excellent links |
 
-### Packets per super-frame (RS level L1)
+### Throughput
 
-| Modulation | LDPC rate | M | bpg | Pkts/frame | Payload/frame |
-|------------|-----------|---|-----|-----------|---------------|
-| BPSK       | R1/2      | 2 | 5   | 18        | ~3.4 KB       |
-| QPSK       | R2/3      | 3 | 5   | 51        | ~9.7 KB       |
-| 16-QAM     | R3/4      | 3 | 5   | 105       | ~20 KB        |
-| 64-QAM     | R3/4      | 3 | 5   | 159       | ~30 KB        |
-| 64-QAM     | R5/6      | 4 | 6   | 180       | ~34 KB        |
+Gross OFDM symbol rate: 37.5 symbols/s (1 symbol every 26.67 ms). With
+36 data subcarriers per symbol the gross information rates before FEC are:
 
-### Net payload throughput (asymptotic, per RS level)
+| Modulation | bits/symbol | Gross rate |
+|---|---|---|
+| BPSK   | 36  | ~135 B/s |
+| QPSK   | 72  | ~270 B/s |
+| 16-QAM | 144 | ~540 B/s |
+| 32-QAM | 180 | ~675 B/s |
+| 64-QAM | 216 | ~810 B/s |
 
-| Modulation | LDPC rate | L0       | L1       | L2      |
-|------------|-----------|----------|----------|---------|
-| BPSK       | R1/2      | ~101 B/s | ~68 B/s  | ~38 B/s |
-| QPSK       | R2/3      | ~263 B/s | ~204 B/s | ~114 B/s|
-| 16-QAM     | R3/4      | ~604 B/s | ~408 B/s | ~294 B/s|
-| 32-QAM     | R3/4      | ~759 B/s | ~513 B/s | ~371 B/s|
-| 64-QAM     | R3/4      | ~905 B/s | ~612 B/s | ~441 B/s|
-| 64-QAM     | R5/6      | ~981 B/s | ~685 B/s | ~441 B/s|
-
-Time to transmit 100 KB with 64-QAM: ~1.7 min (L0 R5/6) · ~2.4 min (L1 R5/6) · ~3.8 min (L2 R3/4).
-Time with BPSK R1/2: ~16.5 min (L0) · ~24 min (L1) · ~44 min (L2).
+After LDPC inner code (rate 1/2 … 5/6), RS outer code (L0/L1/L2) and
+M-way byte interleaving, the net payload throughput is roughly 0.35 … 0.8 ×
+the gross rate depending on the protection level.
 
 ---
 
@@ -213,9 +235,9 @@ cargo run --release --bin tx -- --input <file> --output <out.wav> --callsign <CA
 | `--rs` | `0` `1` `2` | `1` (L1) |
 | `--no-resync` | flag | resync **on** by default |
 
-Every transmission is preceded by a **612 ms beacon** that:
-- plays a 1 kHz tone for 360 ms (activates VOX-switched transmitters)
-- follows with a ZC preamble + 5 BPSK OFDM symbols carrying `"DE <CALL> <mode> <filename>"`
+Every transmission is preceded by a beacon (~640 ms) that:
+- plays a 1 kHz tone for 10 OFDM symbol periods (≈ 267 ms) to activate VOX-switched transmitters
+- follows with a ZC preamble + 9 BPSK OFDM symbols carrying `"DE <CALL> <mode> <filename>"`
 - lets the TX chain and repeater squelch fully open before data starts
 
 Re-sync ZC symbols are inserted every 12 data symbols by default (`--no-resync` to disable).
@@ -238,22 +260,26 @@ speech, or noise — are all decoded in one pass.  Progress is shown on stderr.
 
 ### Audio pipeline
 
-| Direction | Operation | Details |
-|-----------|-----------|---------|
-| TX 8→48 kHz | Nearest-neighbour upsample | Repeat × 6; no phase distortion |
-| RX 48→8 kHz | 13-tap Hamming-windowed sinc LPF | fc = 4 kHz, group delay = 1 sample @ 8 kHz |
+The OFDM chain runs natively at 48 kHz — no resampling is required. The TX
+writes 16-bit stereo WAV files (both channels identical) and the RX accepts
+48 kHz mono or stereo input.
 
-The TX/RX round-trip is mathematically exact in loopback (nearest-neighbour × box-
-average = identity).  For real soundcard input the FIR provides >40 dB stopband
-attenuation above 4 kHz, preventing speech/noise aliases from contaminating the
-OFDM band (312–2531 Hz).
+A symbol-boundary raised-cosine taper (32-sample default, `--smooth-tw`)
+smooths the time-domain transition between consecutive OFDM symbols so the
+CP discontinuity no longer leaks broadband energy into the FM audio stage.
 
 ---
 
 ## Status
 
-Work in progress. The full codec stack (TX + RX + simulation) is implemented and tested.
-Image encode/decode, Hamlib integration, and the web interface are not yet wired up.
+Work in progress. The full codec stack (TX + RX + simulation) is implemented and
+tested through a realistic NBFM channel model (audio HPF 300 Hz + LPF 3 kHz +
+GNU Radio-style pre-emphasis / de-emphasis τ = 75 µs + optional hard-clip
+deviation limiter). Image encode/decode, Hamlib integration, and the web
+interface are not yet wired up.
+
+Pre-built binaries (Windows + Linux static) are attached to each GitHub
+release: https://github.com/hb9tob/RustPIC/releases
 
 ---
 

@@ -40,7 +40,7 @@ pub const BEACON_TONE_SYMS: usize = 10;
 
 /// Number of BPSK OFDM symbols carrying the announcement text.
 /// 8 × NUM_CARRIERS = 8 × 47 = 376 bits ≥ 360 bits required (magic+len+text+crc).
-pub const BEACON_ANN_SYMS: usize = 8;
+pub const BEACON_ANN_SYMS: usize = 9;
 
 /// Total symbols in the beacon block (tone + 2×ZC + ANN).
 pub const BEACON_TOTAL_SYMS: usize = BEACON_TONE_SYMS + 2 + BEACON_ANN_SYMS; // 17

@@ -75,6 +75,17 @@ const QAM64_D: f32 = 0.154_303_35; // 1/√42
 /// by symbol: `[llr_b0_sym0, llr_b1_sym0, …, llr_b0_sym1, llr_b1_sym1, …]`.
 ///
 /// [`SymbolEqualizer`]: crate::ofdm::rx::equalizer::SymbolEqualizer
+/// Maximum absolute LLR value fed to the LDPC decoder.
+///
+/// Over narrowband FM channels the pilot-based noise-variance estimate can be
+/// far too optimistic (the FM discriminator's f²-noise floor is not captured by
+/// pilot tracking), producing LLRs of 500–13 000 for a 20 dB pilot SNR.
+/// Such extreme LLRs saturate the min-sum check-node messages and prevent
+/// LDPC from converging even when most hard decisions are correct.
+/// Clipping to ±20 keeps the decoder in its linear operating region without
+/// meaningfully degrading performance when the channel is genuinely clean.
+const LLR_MAX: f32 = 20.0;
+
 pub fn demap(symbols: &[Complex32], noise_var: &[f32], modulation: Modulation) -> Vec<f32> {
     assert_eq!(symbols.len(), noise_var.len());
     let bps      = modulation.bits_per_symbol();
@@ -85,7 +96,9 @@ pub fn demap(symbols: &[Complex32], noise_var: &[f32], modulation: Modulation) -
         // Clamp noise variance to avoid division by zero
         let nv_safe = nv.max(1e-10);
         let sym_llrs = max_log_llr(y, &pts, bps, nv_safe);
-        llrs.extend_from_slice(&sym_llrs);
+        for l in sym_llrs {
+            llrs.push(l.clamp(-LLR_MAX, LLR_MAX));
+        }
     }
     llrs
 }

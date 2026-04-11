@@ -116,7 +116,7 @@ fn main() {
     let mut n_files:       usize = 0;       // transmissions successfully decoded
     let mut n_frames_seen: usize = 0;       // total super-frames across all transmissions
 
-    let corr = ZcCorrelator::new(0.40, 0.30);
+    let corr = ZcCorrelator::new(0.35, 0.20);
     let mut next_progress = audio.len() / 10;
 
     while search_start + 3 * SYMBOL_LEN <= audio.len() {
@@ -130,8 +130,33 @@ fn main() {
         let window_end = (search_start + SCAN_WINDOW).min(audio.len());
         let sync = match corr.find_sync(&audio[search_start..window_end]) {
             Ok(s)  => s,
-            Err(_) => { search_start += SYMBOL_LEN; continue; }
+            Err(e) => {
+                if std::env::var("SYNC_DEBUG").is_ok() {
+                    eprintln!("  [sync] search_start={search_start} ({:.3}s): {e}",
+                        search_start as f64 / SAMPLE_RATE as f64);
+                }
+                search_start += SYMBOL_LEN; continue;
+            }
         };
+        if std::env::var("SYNC_DEBUG").is_ok() {
+            eprintln!("  [sync] FOUND at {:.3}s: preamble+{} m1={:.3} m2={:.3} cfo={:.1}Hz",
+                search_start as f64 / SAMPLE_RATE as f64,
+                sync.preamble_start, sync.metric, sync.confirm_metric, sync.cfo_hz);
+        }
+        if std::env::var("CH_DEBUG").is_ok() {
+            eprintln!("  [ch] t={:.3}s — H[k] mag (dB) and phase (deg), k=0..NUM_CARRIERS-1:",
+                search_start as f64 / SAMPLE_RATE as f64);
+            eprint!("  [ch] |H| dB: ");
+            for h in sync.channel_est.iter() {
+                eprint!("{:+5.1} ", 20.0 * (h.norm() + 1e-12).log10());
+            }
+            eprintln!();
+            eprint!("  [ch] arg H: ");
+            for h in sync.channel_est.iter() {
+                eprint!("{:+4.0} ", h.arg().to_degrees());
+            }
+            eprintln!();
+        }
 
         let abs_preamble = search_start + sync.preamble_start;
 

@@ -371,12 +371,16 @@ impl FrameReceiver {
         self.pilot_snr_count += 1;
 
         if std::env::var("FRAME_DEBUG").is_ok() {
-            let mean_llr: f32 = if !eq.data.is_empty() {
-                let mean_sq = eq.data.iter().map(|c| c.norm_sqr()).sum::<f32>() / eq.data.len() as f32;
-                mean_sq.sqrt()
-            } else { 0.0 };
-            eprintln!("  [frame.rs] sym={} grp={} snr={:.1}dB mean_eq_amp={:.4}",
-                self.data_syms_received, self.syms_in_group, eq.pilot_snr_db, mean_llr);
+            let (mean_re, mean_im, mean_amp) = if !eq.data.is_empty() {
+                let n = eq.data.len() as f32;
+                let re = eq.data.iter().map(|c| c.re.abs()).sum::<f32>() / n;
+                let im = eq.data.iter().map(|c| c.im.abs()).sum::<f32>() / n;
+                let amp = (eq.data.iter().map(|c| c.norm_sqr()).sum::<f32>() / n).sqrt();
+                (re, im, amp)
+            } else { (0.0, 0.0, 0.0) };
+            eprintln!("  [frame.rs] sym={} grp={} snr={:.1}dB amp={:.3} mean|Re|={:.3} mean|Im|={:.3} Re/Im={:.2}",
+                self.data_syms_received, self.syms_in_group, eq.pilot_snr_db,
+                mean_amp, mean_re, mean_im, mean_re / (mean_im + 1e-9));
         }
 
         let llrs = demap(&eq.data, &eq.noise_var, self.header.modulation);
@@ -407,6 +411,19 @@ impl FrameReceiver {
                 .collect();
 
             // Decode LDPC — decoder borrows &self.code in its own scope
+            if std::env::var("FRAME_DEBUG").is_ok() {
+                let n = block_llrs.len() as f32;
+                let mean_abs = block_llrs.iter().map(|l| l.abs()).sum::<f32>() / n;
+                let min_abs  = block_llrs.iter().map(|l| l.abs()).fold(f32::INFINITY, f32::min);
+                let max_abs  = block_llrs.iter().map(|l| l.abs()).fold(0.0f32, f32::max);
+                let near_zero = block_llrs.iter().filter(|l| l.abs() < 1.0).count();
+                let wrong_sign = hard_bits.iter().zip(block_llrs.iter())
+                    .filter(|(&h, &l)| (h == 1) == (l > 0.0))  // h=1→bit=1, expect l<0
+                    .count();
+                eprintln!("  [ldpc] blk={} mean|LLR|={:.2} min={:.2} max={:.2} near0={} bad_sign={}/{}",
+                    self.ldpc_blocks_decoded, mean_abs, min_abs, max_abs,
+                    near_zero, wrong_sign, block_llrs.len());
+            }
             let decode_result = {
                 let decoder = LdpcDecoder::new(&self.code, 50, 0.75);
                 decoder.decode(&block_llrs)

@@ -51,6 +51,11 @@ struct Cfg {
     ppm:      f32,
     offset:   usize,
     seed:     Option<u64>,
+    fm_chan:  bool,   // apply pre-emph → clip → de-emph pipeline
+    fm_tau:   f32,    // pre-emph time constant in µs (75 = standard NBFM, matches GNU Radio default)
+    fm_clip:  f32,    // hard-clip threshold in dB above pre-emph'd RMS (inf = no clip)
+    audio_hp: f32,    // audio HPF cutoff in Hz (0 = off) — models radio mic HPF
+    audio_lp: f32,    // audio LPF cutoff in Hz (0 = off) — models radio audio LPF
 }
 
 impl Default for Cfg {
@@ -63,6 +68,11 @@ impl Default for Cfg {
             ppm:      0.0,
             offset:   2000,
             seed:     None,
+            fm_chan:  false,
+            fm_tau:   75.0,
+            fm_clip:  f32::INFINITY,
+            audio_hp: 0.0,
+            audio_lp: 0.0,
         }
     }
 }
@@ -89,6 +99,15 @@ fn parse_args() -> Cfg {
                 .unwrap_or_else(|_| die("--offset expects an integer")); }
             "--seed"     => { i += 1; cfg.seed = Some(args[i].parse::<u64>()
                 .unwrap_or_else(|_| die("--seed expects an integer"))); }
+            "--fm-channel" => { cfg.fm_chan = true; }
+            "--fm-tau"   => { i += 1; cfg.fm_tau = args[i].parse::<f32>()
+                .unwrap_or_else(|_| die("--fm-tau expects µs value, e.g. 750")); }
+            "--fm-clip"  => { i += 1; cfg.fm_clip = args[i].parse::<f32>()
+                .unwrap_or_else(|_| die("--fm-clip expects dB above RMS, e.g. 10")); }
+            "--audio-hp" => { i += 1; cfg.audio_hp = args[i].parse::<f32>()
+                .unwrap_or_else(|_| die("--audio-hp expects Hz, e.g. 300")); }
+            "--audio-lp" => { i += 1; cfg.audio_lp = args[i].parse::<f32>()
+                .unwrap_or_else(|_| die("--audio-lp expects Hz, e.g. 3000")); }
             "--help"|"-h" => { print_help(); std::process::exit(0); }
             a => die(&format!("unknown argument: {a}  (try --help)")),
         }
@@ -112,6 +131,12 @@ fn print_help() {
     println!("  --ppm    <n>       Clock offset in ppm (default: 0)");
     println!("  --offset <n>       Prepend N silence samples (default: 2000)");
     println!("  --seed   <n>       RNG seed for reproducibility");
+    println!("  --fm-channel       Apply FM pre-emphasis → hard-clip → de-emphasis pipeline");
+    println!("                     (models G3E marine FM modulator nonlinearity)");
+    println!("  --fm-tau <µs>      Pre-/de-emphasis time constant (default: 750 = ITU-R)");
+    println!("  --fm-clip <dB>     Clip threshold in dB above pre-emph'd RMS (default: inf)");
+    println!("                     Lower = more clipping = more ICI.  Try 10 for heavy,");
+    println!("                     15 for moderate, 20 for mild, inf (no flag) for none.");
     println!();
     println!("NOISE MODELS:");
     println!("  AWGN (default): white noise, same SNR on all subcarriers.");
@@ -136,10 +161,10 @@ fn main() {
         die(&format!("unsupported sample rate {rate} Hz (expected 48000 or 8000)"));
     }
 
-    let n = tx_samples.len();
+    let n_in = tx_samples.len();
     println!("sim48");
     println!("  Input    : {} ({} samples @ {} Hz, {:.1} s)",
-        cfg.input, n, rate, n as f64 / rate as f64);
+        cfg.input, n_in, rate, n_in as f64 / rate as f64);
     println!("  Noise    : {} @ {:.1} dB SNR",
         if cfg.fm_noise { "FM f²" } else { "AWGN" }, cfg.snr_db);
     if cfg.ppm != 0.0 {
@@ -154,6 +179,40 @@ fn main() {
         Some(s) => StdRng::seed_from_u64(s),
         None    => StdRng::from_entropy(),
     };
+
+    // ── Optional audio-path HPF / LPF (models radio mic HPF + audio LPF) ──────
+    // Applied first: the input signal hits the radio's audio input stage before
+    // anything else.  One-pole IIR filters; simple but matches analog reality.
+    let tx_samples = if cfg.audio_hp > 0.0 {
+        println!("  Audio HP : {:.0} Hz (1-pole IIR)", cfg.audio_hp);
+        one_pole_hpf(&tx_samples, cfg.audio_hp, rate as f32)
+    } else {
+        tx_samples
+    };
+    let tx_samples = if cfg.audio_lp > 0.0 {
+        println!("  Audio LP : {:.0} Hz (1-pole IIR)", cfg.audio_lp);
+        one_pole_lpf(&tx_samples, cfg.audio_lp, rate as f32)
+    } else {
+        tx_samples
+    };
+
+    // ── Optional FM channel: pre-emph → clip → de-emph ────────────────────────
+    // Applied BEFORE noise, since the FM modulator's nonlinearity happens at
+    // the transmitter and the resulting ICI is then observed alongside channel
+    // AWGN at the receiver.
+    let tx_samples = if cfg.fm_chan {
+        let (out, clipped_frac, peak_boost_db) =
+            apply_fm_channel(&tx_samples, cfg.fm_tau, cfg.fm_clip, rate as f32);
+        println!("  FM chan  : τ={:.0}µs  clip={}  boost={:+.1}dB  clipped={:.2}%",
+            cfg.fm_tau,
+            if cfg.fm_clip.is_finite() { format!("{:.1}dB", cfg.fm_clip) } else { "none".to_string() },
+            peak_boost_db,
+            100.0 * clipped_frac);
+        out
+    } else {
+        tx_samples
+    };
+    let n = tx_samples.len();
 
     // ── Noise sigma from signal RMS ───────────────────────────────────────────
     // SNR = P_signal / P_noise  →  sigma = sqrt(P_signal / 10^(snr/10))
@@ -213,6 +272,158 @@ fn main() {
     let n_out = samples_i16.len();
     println!("  Output   : {} ({} samples, {:.1} s)",
         cfg.output, n_out, n_out as f64 / rate as f64);
+}
+
+// ── Audio HPF / LPF (1-pole IIR — matches an analog RC filter) ──────────────
+
+/// 1-pole high-pass filter: y[n] = a·(y[n-1] + x[n] − x[n-1]).
+/// Corner frequency `fc` in Hz; -3 dB at fc, -6 dB/oct roll-off below.
+///
+/// Matches a simple RC HPF, which is what typical NBFM radio mic inputs use
+/// to block the audio sub-band (< 300 Hz) before the modulator.  The -6 dB/oct
+/// magnitude roll-off comes with a 90° phase rotation across the corner,
+/// which is exactly the non-linear phase region that breaks pilot-based
+/// linear interpolation when pilot 0 sits near or below `fc`.
+fn one_pole_hpf(samples: &[f32], fc: f32, fs: f32) -> Vec<f32> {
+    let rc = 1.0 / (2.0 * std::f32::consts::PI * fc);
+    let dt = 1.0 / fs;
+    let a  = rc / (rc + dt);                // ≈ 1 − 2π·fc·dt
+    let mut out = Vec::with_capacity(samples.len());
+    let mut x_prev = 0.0_f32;
+    let mut y_prev = 0.0_f32;
+    for &x in samples {
+        let y = a * (y_prev + x - x_prev);
+        out.push(y);
+        x_prev = x;
+        y_prev = y;
+    }
+    out
+}
+
+/// 1-pole low-pass filter: y[n] = a·x[n] + (1−a)·y[n-1].
+/// Corner frequency `fc` in Hz; -3 dB at fc.
+fn one_pole_lpf(samples: &[f32], fc: f32, fs: f32) -> Vec<f32> {
+    let rc = 1.0 / (2.0 * std::f32::consts::PI * fc);
+    let dt = 1.0 / fs;
+    let a  = dt / (rc + dt);
+    let mut out = Vec::with_capacity(samples.len());
+    let mut y_prev = 0.0_f32;
+    for &x in samples {
+        let y = a * x + (1.0 - a) * y_prev;
+        out.push(y);
+        y_prev = y;
+    }
+    out
+}
+
+// ── FM channel nonlinearity (pre-emph → clip → de-emph) ─────────────────────
+
+/// Models the NBFM modulator nonlinearity (pre-emph → hard-clip → de-emph),
+/// mirroring GNU Radio's `fm_emph.fm_preemph` / `fm_deemph` (bilinear-transform
+/// IIRs, τ=75 µs default).
+///
+/// Pre-emphasis analog transfer function (GNU Radio `fm_preemph`):
+///
+/// ```text
+///            s + 1/τ
+///   H(s) = ───────────          (normalised so H(0) = 0 dB)
+///           s + 2π·fh
+/// ```
+///
+/// where `fh = 0.925 · fs/2` flattens the filter before the Nyquist pole so
+/// the bilinear design stays stable.  In-band boost for τ=75 µs on the 47
+/// RustPIC carriers is ≈ 0 dB at 328 Hz, +3.7 dB at 2484 Hz.  Out-of-band
+/// boost reaches ~+9 dB at 6 kHz, which is where symbol-boundary leakage can
+/// push the modulator past its deviation limit.
+///
+/// The simulator clips the pre-emphasised waveform at `thr = rms·10^(clip/20)`
+/// to model that deviation limiter, then inverts the pre-emph with the
+/// matching de-emphasis IIR (`H(s) = (1/τ)/(s + 1/τ)`).
+///
+/// Returns `(output, clipped_fraction, peak_boost_db)`.
+fn apply_fm_channel(
+    samples: &[f32],
+    tau_us:  f32,
+    clip_db: f32,
+    fs:      f32,
+) -> (Vec<f32>, f32, f32) {
+    let tau = tau_us * 1e-6;
+
+    // ── 1. Pre-emphasis (GNU Radio fm_preemph) ────────────────────────────────
+    //
+    // Analog:  H(s) = (s + w_cl) / (s + w_ch)  with w_cl = 1/τ, w_ch = 2π·fh.
+    // Bilinear design with pre-warping, then normalise to H(z=1) = 1 (0 dB DC).
+    let w_cl = 1.0_f32 / tau;
+    let fh   = 0.925_f32 * fs / 2.0;
+    let w_ch = 2.0_f32 * std::f32::consts::PI * fh;
+
+    let w_cla = 2.0 * fs * (w_cl / (2.0 * fs)).tan();
+    let w_cha = 2.0 * fs * (w_ch / (2.0 * fs)).tan();
+    let kl    = -w_cla / (2.0 * fs);
+    let kh    = -w_cha / (2.0 * fs);
+    let z1    = (1.0 + kl) / (1.0 - kl);
+    let p1    = (1.0 + kh) / (1.0 - kh);
+    let b0    = (1.0 - kl) / (1.0 - kh);
+
+    // Normalise to 0 dB at DC (z = 1):  g = (1 − p1) / (b0·(1 − z1)).
+    let g   = (1.0 - p1) / (b0 * (1.0 - z1));
+    let gb0 = g * b0;
+
+    let peak_in: f32 = samples.iter()
+        .map(|&x| x.abs())
+        .fold(0.0_f32, f32::max);
+
+    let mut pre: Vec<f32> = Vec::with_capacity(samples.len());
+    let mut x_prev = 0.0_f32;
+    let mut y_prev = 0.0_f32;
+    for &x in samples {
+        // btaps = [g·b0, -g·b0·z1], ataps = [1, -p1]
+        let y = gb0 * x - gb0 * z1 * x_prev + p1 * y_prev;
+        pre.push(y);
+        x_prev = x;
+        y_prev = y;
+    }
+
+    let peak_pre: f32 = pre.iter()
+        .map(|&x| x.abs())
+        .fold(0.0_f32, f32::max);
+    let boost_db = 20.0 * (peak_pre / peak_in.max(1e-12)).log10();
+
+    // ── 2. Hard clip (FM deviation limiter proxy) ────────────────────────────
+    let rms_pre = (pre.iter().map(|&x| x * x).sum::<f32>() / pre.len() as f32).sqrt();
+    let thr     = rms_pre * 10_f32.powf(clip_db / 20.0);
+    let mut clipped = 0_usize;
+    if clip_db.is_finite() {
+        for s in pre.iter_mut() {
+            if s.abs() > thr {
+                *s = s.signum() * thr;
+                clipped += 1;
+            }
+        }
+    }
+    let clipped_frac = clipped as f32 / pre.len() as f32;
+
+    // ── 3. De-emphasis (GNU Radio fm_deemph) ─────────────────────────────────
+    //
+    // Analog:  H(s) = w_ca / (s + w_ca) with w_c = 1/τ.  Same bilinear design.
+    let w_c_d  = 1.0_f32 / tau;
+    let w_cad  = 2.0 * fs * (w_c_d / (2.0 * fs)).tan();
+    let kd     = -w_cad / (2.0 * fs);
+    let z1d    = -1.0_f32;
+    let p1d    = (1.0 + kd) / (1.0 - kd);
+    let b0d    = -kd / (1.0 - kd);
+
+    let mut out: Vec<f32> = Vec::with_capacity(pre.len());
+    let mut x_prev = 0.0_f32;
+    let mut y_prev = 0.0_f32;
+    for &x in pre.iter() {
+        let y = b0d * x - b0d * z1d * x_prev + p1d * y_prev;
+        out.push(y);
+        x_prev = x;
+        y_prev = y;
+    }
+
+    (out, clipped_frac, boost_db)
 }
 
 // ── Noise generators ─────────────────────────────────────────────────────────

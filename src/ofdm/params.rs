@@ -8,14 +8,21 @@
 //! ```text
 //! FFT size  = 1024,  fs = 48 000 Hz  →  Δf = 46.875 Hz / bin
 //!
-//! Active band : bins 7 … 53  (≈ 328 Hz … 2484 Hz)
-//! 47 subcarriers, pilots every 8th (k = 0, 8, 16, 24, 32, 40 → 6 pilots)
+//! Active band : bins 12 … 53  (≈ 562 Hz … 2484 Hz)
+//! 42 subcarriers, pilots every 8th (k = 0, 8, 16, 24, 32, 40 → 6 pilots)
 //!
 //! Subcarrier frequencies (Hz):
-//!   bins 7, 8, …, 53  →  328, 375, …, 2484 Hz
+//!   bins 12, 13, …, 53  →  562, 609, …, 2484 Hz
 //!
-//! FIRST_BIN = 7 keeps the signal above the FM sub-audio / CTCSS range
-//! (typically < 300 Hz) and is parameterizable via the constant below.
+//! FIRST_BIN = 12 (was 7) keeps the signal above the non-linear phase region
+//! of typical NBFM voice HPFs.  Measurements on OTA recordings (G3E marine)
+//! show that the audio HPF at ~300 Hz creates phase rotations of > 100°
+//! between adjacent bins for frequencies < 560 Hz — far too steep for the
+//! pilot-based linear interpolation (pilots every 8 carriers) to track,
+//! causing the 5 lowest carriers to contribute > 5 % raw BER on their own.
+//! Starting at 562 Hz places pilot 0 in the linear-delay region of the
+//! channel, restoring clean equalization at the cost of 5 carriers
+//! (~15 % throughput).  See memory/feedback_first_bin.md.
 //! ```
 //!
 //! # Symbol timing (DRM Mode B)
@@ -57,15 +64,16 @@ pub const SUBCARRIER_SPACING: f32 = SAMPLE_RATE / FFT_SIZE as f32; // 46.875 Hz
 
 // ── Active subcarrier mapping ─────────────────────────────────────────────────
 
-/// FFT bin index of the first active subcarrier (≈ 328 Hz).
+/// FFT bin index of the first active subcarrier (≈ 562 Hz).
 ///
-/// Keeping the signal above 300 Hz avoids the FM sub-audio / CTCSS range.
-/// Parameterizable: increase to push the lower edge higher.
-pub const FIRST_BIN: usize = 7;
+/// Chosen to keep pilot 0 above the ~300 Hz audio HPF where typical NBFM
+/// radios introduce a steep phase non-linearity that the 8-carrier pilot
+/// interpolation cannot track.
+pub const FIRST_BIN: usize = 12;
 
 /// Total number of active subcarriers (data + pilots).
-/// Covers bins 7 … 53  (≈ 328 Hz … 2484 Hz).
-pub const NUM_CARRIERS: usize = 47;
+/// Covers bins 12 … 53  (≈ 562 Hz … 2484 Hz).
+pub const NUM_CARRIERS: usize = 42;
 
 /// FFT bin index of the last active subcarrier (inclusive), ≈ 2484 Hz.
 pub const LAST_BIN: usize = FIRST_BIN + NUM_CARRIERS - 1; // 53
@@ -88,7 +96,7 @@ pub const NUM_DATA: usize = NUM_CARRIERS - NUM_PILOTS; // 41
 // ── ZC preamble ───────────────────────────────────────────────────────────────
 
 /// Zadoff–Chu root.  Must be coprime with `ZC_LEN`.
-/// 47 is prime so any root 1…46 is coprime; 25 chosen to match prior design.
+/// ZC_LEN = 42 = 2·3·7; 25 = 5² is coprime with 42 (gcd = 1).
 pub const ZC_ROOT: u32 = 25;
 
 /// ZC sequence length (= number of active subcarriers for a full-band preamble).
@@ -183,10 +191,10 @@ mod tests {
 
     #[test]
     fn carrier_frequencies() {
-        // First carrier ≈ 328 Hz, last ≈ 2484 Hz
+        // First carrier ≈ 562 Hz, last ≈ 2484 Hz
         let f_first = carrier_to_bin(0) as f32 * SUBCARRIER_SPACING;
         let f_last  = carrier_to_bin(NUM_CARRIERS - 1) as f32 * SUBCARRIER_SPACING;
-        assert!((f_first - 328.125).abs() < 0.1);
+        assert!((f_first - 562.5).abs() < 0.1);
         assert!((f_last  - 2484.375).abs() < 0.1);
     }
 }

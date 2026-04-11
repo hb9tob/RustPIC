@@ -16,11 +16,14 @@
 
 use std::io::Write as IoWrite;
 
+use num_complex::Complex32;
+use rustfft::FftPlanner;
+
 use rustpic::{
     fec::rs::RsLevel,
     ofdm::{
         beacon::build_beacon,
-        params::SAMPLE_RATE,
+        params::{CP_LEN, FFT_SIZE, SAMPLE_RATE, SYMBOL_LEN},
         rx::{
             frame::max_packets_per_frame,
             mode_detect::{LdpcRate, Modulation},
@@ -41,6 +44,9 @@ struct Cfg {
     resync:     bool,
     papr_clip:  Option<f32>,  // soft-clip threshold in dB above RMS; None = no clipping
     gain_db:    f32,           // additional gain applied after peak normalisation (dB)
+    deemph_tau: Option<f32>,  // de-emphasis time constant in µs; None = disabled
+    bandpass:   bool,          // post-OFDM bandpass filter (mirrors QSSTV CDRMBandpassFilt)
+    smooth_tw:  usize,         // raised-cosine boundary taper width in samples (0 = off)
 }
 
 impl Default for Cfg {
@@ -55,6 +61,9 @@ impl Default for Cfg {
             resync:     true,  // on by default — required for BPSK/QPSK over independent soundcards
             papr_clip:  None,
             gain_db:    0.0,
+            deemph_tau: None,
+            bandpass:   false,
+            smooth_tw:  32,
         }
     }
 }
@@ -76,6 +85,20 @@ fn parse_args() -> Cfg {
                     .unwrap_or_else(|_| die("--papr expects a dB value, e.g. --papr 12")));
             }
             "--no-papr" => { cfg.papr_clip = None; }
+            "--deemph" => {
+                i += 1;
+                cfg.deemph_tau = Some(args[i].parse::<f32>()
+                    .unwrap_or_else(|_| die("--deemph expects time constant in µs, e.g. --deemph 750")));
+            }
+            "--no-deemph" => { cfg.deemph_tau = None; }
+            "--bpf"       => { cfg.bandpass = true; }
+            "--no-bpf"    => { cfg.bandpass = false; }
+            "--smooth-tw" => {
+                i += 1;
+                cfg.smooth_tw = args[i].parse::<usize>()
+                    .unwrap_or_else(|_| die("--smooth-tw expects a non-negative integer"));
+            }
+            "--no-smooth" => { cfg.smooth_tw = 0; }
             "--gain" => {
                 i += 1;
                 cfg.gain_db = args[i].parse::<f32>()
@@ -137,6 +160,21 @@ fn print_help() {
     println!("  --no-resync          Disable re-sync ZC symbols (on by default)");
     println!("  --papr  <dB>         PAPR soft-clip threshold dB above RMS [default: 12]");
     println!("  --no-papr            Disable PAPR clipping");
+    println!("  --deemph <µs>        Apply TX de-emphasis before FM radio microphone input.");
+    println!("                       Use 750 for G3E marine / European NBFM (ITU-R),");
+    println!("                       530 for NBFM 75µs (North America).");
+    println!("                       Prevents FM deviation clipping caused by pre-emphasis");
+    println!("                       boosting high-frequency OFDM carriers by up to 21 dB.");
+    println!("  --no-deemph          Disable TX de-emphasis (default: off)");
+    println!("  --no-bpf             Disable post-OFDM bandpass filter (default: off).");
+    println!("                       The bandpass confines energy to ~280-2620 Hz, matching");
+    println!("                       QSSTV HamDRM's CDRMBandpassFilt.  Prevents out-of-band");
+    println!("                       spectral leakage from feeding the FM pre-emphasis region.");
+    println!("  --smooth-tw <N>      Raised-cosine symbol-boundary taper width in samples");
+    println!("                       (default: 32, 0 = off).  Kills the inter-symbol time-");
+    println!("                       domain discontinuity that creates broadband out-of-band");
+    println!("                       leakage when the FM pre-emphasis amplifies high carriers.");
+    println!("  --no-smooth          Disable symbol-boundary smoothing (equivalent to --smooth-tw 0).");
     println!("  --gain  <dB>         Additional audio gain in dB, e.g. --gain 6  (positive = louder)");
 }
 
@@ -184,14 +222,54 @@ fn main() {
     let beacon = build_beacon(&cfg.callsign, &name, &mode_str);
 
     // Flatten beacon + all super-frames; take only the real part (baseband audio).
-    let samples_f: Vec<f32> = beacon.iter().map(|s| s.re)
+    let mut samples_f: Vec<f32> = beacon.iter().map(|s| s.re)
         .chain(frames.iter().flat_map(|f| f.iter().map(|s| s.re)))
         .collect();
     let n_base_samples = samples_f.len();
 
+    // OFDM symbol-boundary smoothing — kills the broadband spectral leakage
+    // caused by time-domain discontinuities at every SYMBOL_LEN boundary.
+    //
+    // QSSTV suppresses this leakage with a post-OFDM FIR bandpass filter
+    // (drmtx/common/util/Utilities.cpp:127 CDRMBandpassFilt), but a long FIR
+    // smears the data-frame ZC#1 with preceding ANN content and breaks our
+    // time-domain ZC correlator (see memory/feedback_bandpass_zc.md).  A
+    // per-symbol raised-cosine taper achieves the same spectral result with no
+    // smearing across symbol boundaries: the last T_w samples of each symbol
+    // go to zero, and the first T_w samples of the next symbol rise from zero,
+    // so the transition is a smooth zero crossing.
+    if cfg.smooth_tw > 0 {
+        smooth_symbol_boundaries(&mut samples_f, cfg.smooth_tw);
+    }
+
+    // Optional TX de-emphasis (inverse pre-emphasis) for FM radio use.
+    // The FM radio's internal pre-emphasis boosts the OFDM carriers by up to
+    // 21 dB at 2484 Hz (G3E marine, τ=750 µs), causing FM deviation clipping
+    // and severe ICI.  Applying de-emphasis here cancels that boost so the
+    // modulator sees a flat spectrum.  The ZF equalizer at RX handles the
+    // residual channel shape (RX radio de-emphasis slope is visible in H[k]).
+    let samples_f = if let Some(tau_us) = cfg.deemph_tau {
+        apply_deemph(&samples_f, tau_us, SAMPLE_RATE as usize)
+    } else {
+        samples_f
+    };
+
     // Optional soft-clip PAPR reduction (tanh-based).
     let samples_f = if let Some(clip_db) = cfg.papr_clip {
         papr_clip(&samples_f, clip_db)
+    } else {
+        samples_f
+    };
+
+    // Post-OFDM bandpass filter confining energy to the active carrier band.
+    // Mirrors QSSTV CDRMBandpassFilt in drmtx/common/util/Utilities.cpp:127 —
+    // QSSTV's Mode B uses a Nuttall-windowed 2.5 kHz lowpass shifted to the DRM
+    // IF centre.  Our real-baseband equivalent is a raised-cosine bandpass over
+    // 280…2620 Hz that passes bins 7…53 (328…2484 Hz) flat and suppresses
+    // everything else.  Applied last so CP discontinuities and PAPR-clip spurs
+    // do not leak into the FM pre-emphasis region and create ICI.
+    let samples_f = if cfg.bandpass {
+        apply_bandpass(&samples_f, SAMPLE_RATE as usize)
     } else {
         samples_f
     };
@@ -222,13 +300,16 @@ fn main() {
     println!("RustPIC TX");
     println!("  Callsign : {}", cfg.callsign);
     println!("  Input    : {} ({} bytes)", cfg.input, raw.len());
-    println!("  Mode     : {}  {}  RS-L{}{}{}{}",
+    println!("  Mode     : {}  {}  RS-L{}{}{}{}{}",
         mod_label(cfg.modulation),
         rate_label(cfg.ldpc_rate),
         match cfg.rs_level { RsLevel::L0 => "0", RsLevel::L1 => "1", RsLevel::L2 => "2" },
         if cfg.resync { "  resync" } else { "" },
         if let Some(db) = cfg.papr_clip { format!("  papr-clip={db}dB") } else { String::new() },
+        if let Some(tau) = cfg.deemph_tau { format!("  deemph={tau}µs") } else { String::new() },
         if cfg.gain_db != 0.0 { format!("  gain={:+.1}dB", cfg.gain_db) } else { String::new() });
+    println!("  BPF      : {}", if cfg.bandpass { "280-2620 Hz (QSSTV-style)" } else { "off" });
+    println!("  Smooth   : {}", if cfg.smooth_tw > 0 { format!("{} samples raised-cosine taper", cfg.smooth_tw) } else { "off".to_string() });
     println!("  RS pkts  : {} total, ≤ {}/frame, rs_k={}", (raw.len() + 4).div_ceil(rs_k), pkt_per_frame, rs_k);
     println!("  Beacon   : {} ms (1 kHz VOX tone + ZC + indicatif)", beacon_ms);
     println!("  Frames   : {}", n_frames);
@@ -237,6 +318,197 @@ fn main() {
 }
 
 // ── Audio helpers ─────────────────────────────────────────────────────────────
+
+/// Per-symbol frequency-domain de-emphasis (inverse pre-emphasis) for OFDM.
+///
+/// A time-domain IIR filter would introduce inter-symbol transients at every
+/// symbol boundary, reducing the ZC preamble's matched-filter metric below the
+/// detection threshold.  Applying de-emphasis in the frequency domain avoids
+/// this: each OFDM symbol is de-emphasized independently with no inter-symbol
+/// memory, so there are no transients.
+///
+/// For each SYMBOL_LEN = CP_LEN + FFT_SIZE block:
+///   1. FFT of the 1024-sample useful window.
+///   2. Multiply each bin k by |H_de(f_k)| = f₀/√(f₀²+f_k²).
+///   3. IFFT → regenerate cyclic prefix from the new window tail.
+///
+/// The gain profile is the amplitude response of H(s) = 1/(1+s·τ),
+/// the inverse of the FM radio's internal pre-emphasis filter.
+/// After the radio applies its pre-emphasis, the OFDM spectrum is flat.
+/// The ZF equaliser at RX already corrects for the residual RX de-emphasis slope.
+///
+/// Typical values: τ = 750 µs (G3E marine / ITU-R European NBFM, f₀ = 212 Hz)
+///                 τ = 530 µs (North-American NBFM,              f₀ = 300 Hz)
+fn apply_deemph(samples: &[f32], tau_us: f32, fs: usize) -> Vec<f32> {
+    let tau = tau_us * 1e-6;
+    let f0  = 1.0 / (2.0 * std::f32::consts::PI * tau);   // corner freq [Hz]
+    let df  = fs as f32 / FFT_SIZE as f32;                 // bin spacing [Hz]
+
+    // Pre-compute de-emphasis gain for every FFT bin (DC → Nyquist and back).
+    // Bin k → positive freq k·df; bin (FFT_SIZE−k) → negative freq k·df.
+    let gains: Vec<f32> = (0..FFT_SIZE).map(|k| {
+        let freq = if k <= FFT_SIZE / 2 { k as f32 } else { (FFT_SIZE - k) as f32 } * df;
+        f0 / (f0 * f0 + freq * freq).sqrt()    // |H_de(freq)| = f0/√(f0²+f²)
+    }).collect();
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft  = planner.plan_fft_forward(FFT_SIZE);
+    let ifft = planner.plan_fft_inverse(FFT_SIZE);
+    let scale = 1.0 / FFT_SIZE as f32;
+
+    let mut out = samples.to_vec();
+
+    // Process each complete OFDM symbol (CP + FFT window).
+    let mut sym = 0;
+    while sym + SYMBOL_LEN <= out.len() {
+        let win_start = sym + CP_LEN;
+        let win_end   = sym + SYMBOL_LEN;
+
+        // Forward FFT.
+        let mut buf: Vec<Complex32> = out[win_start..win_end]
+            .iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        fft.process(&mut buf);
+
+        // Apply de-emphasis amplitude gains (real filter → symmetric gains).
+        for (b, &g) in buf.iter_mut().zip(gains.iter()) {
+            *b *= g;
+        }
+
+        // Inverse FFT and write back (real part only, normalised).
+        ifft.process(&mut buf);
+        for (i, b) in buf.iter().enumerate() {
+            out[win_start + i] = b.re * scale;
+        }
+
+        // Regenerate CP from the tail of the new FFT window.
+        let cp_src = win_end - CP_LEN;
+        out.copy_within(cp_src..win_end, sym);
+
+        sym += SYMBOL_LEN;
+    }
+
+    out
+}
+
+/// Per-symbol raised-cosine boundary taper.
+///
+/// Multiplies each `SYMBOL_LEN`-aligned block by a Tukey-like envelope: the
+/// first `t_w` samples rise from 0 to 1 through a raised-cosine, the middle is
+/// flat at 1, and the last `t_w` samples fall from 1 to 0.  This eliminates
+/// the time-domain discontinuity at every symbol boundary — the source of the
+/// broadband spectral leakage we want to keep out of the FM pre-emphasis
+/// region that creates ICI after the FM modulator.
+///
+/// The taper sits inside the CP for the first `t_w` samples (the CP is unused
+/// by the RX FFT window, so no data is lost there) and attenuates the last
+/// `t_w` samples of the FFT window for the falling edge.  With `t_w` ≪
+/// `FFT_SIZE`, the resulting bin leakage is negligible (ratio ≈ (t_w/FFT)²),
+/// and the ZC correlation drops from 1.00 to ≈ 1 − 1.5·t_w/SYMBOL_LEN ≈ 0.96
+/// for t_w = 32 — well above the 0.35 sync threshold.
+///
+/// **Assumption**: `samples` is laid out as back-to-back `SYMBOL_LEN` blocks
+/// starting at index 0.  Both the beacon and every data super-frame satisfy
+/// this; the RX does not need to change.
+fn smooth_symbol_boundaries(samples: &mut [f32], t_w: usize) {
+    if t_w == 0 || t_w * 2 >= SYMBOL_LEN || samples.len() < SYMBOL_LEN {
+        return;
+    }
+
+    // Raised-cosine rising edge: window[n] = (1 − cos(π·n/t_w))/2, n ∈ [0, t_w).
+    let window: Vec<f32> = (0..t_w)
+        .map(|n| 0.5 - 0.5 * (std::f32::consts::PI * n as f32 / t_w as f32).cos())
+        .collect();
+
+    let n_syms = samples.len() / SYMBOL_LEN;
+    for k in 0..n_syms {
+        let start = k * SYMBOL_LEN;
+        let end   = start + SYMBOL_LEN;
+        // Rising taper on the first t_w samples (inside the CP — harmless).
+        for n in 0..t_w {
+            samples[start + n] *= window[n];
+        }
+        // Falling taper on the last t_w samples (end of the FFT window).
+        for n in 0..t_w {
+            samples[end - t_w + n] *= window[t_w - 1 - n];
+        }
+    }
+}
+
+/// Linear-phase Kaiser-windowed FIR bandpass, passband 300…2600 Hz.
+///
+/// Mirrors QSSTV's CDRMBandpassFilt (drmtx/common/util/Utilities.cpp:127),
+/// which applies a Nuttall-windowed 2.5 kHz lowpass modulated to the DRM IF
+/// centre on the complex-baseband OFDM signal.  RustPIC emits real audio
+/// directly in baseband, so the equivalent is a real bandpass covering the
+/// active carrier band (328…2484 Hz) with small guard margins.
+///
+/// Without this filter, CP discontinuities, PAPR-clip spurs, and spectral
+/// skirts spill energy below 300 Hz and above 2500 Hz.  Once that signal
+/// goes through an FM transmitter with 75 µs pre-emphasis, the high-frequency
+/// spurs are boosted up to +21 dB and saturate the FM modulator — producing
+/// the ICI that raises the raw channel BER we observe OTA.
+///
+/// Implementation: a 201-tap symmetric FIR built as `ideal_BP × Kaiser(β=4.55)`
+/// (≈50 dB stopband), applied by direct `O(N·L)` convolution.  The output is
+/// aligned with the input (centre tap at `(N-1)/2`) so downstream sync still
+/// finds the beacon/ZC at the expected positions.
+fn apply_bandpass(samples: &[f32], fs: usize) -> Vec<f32> {
+    const N: usize = 201;                 // filter length (odd for symmetry)
+    const MID: usize = (N - 1) / 2;       // group delay = 100 samples
+
+    // Normalised cutoff frequencies (cycles/sample).
+    let f_lo = 300.0_f32 / fs as f32;
+    let f_hi = 2600.0_f32 / fs as f32;
+
+    // Modified Bessel function I₀, series form.
+    fn i0(x: f32) -> f32 {
+        let mut sum  = 1.0_f32;
+        let mut term = 1.0_f32;
+        let half_x   = x * 0.5;
+        for k in 1..30 {
+            let r = half_x / k as f32;
+            term *= r * r;
+            sum  += term;
+            if term < 1e-12 * sum { break; }
+        }
+        sum
+    }
+
+    // Kaiser window, β = 4.55 → ~50 dB stopband attenuation.
+    let beta    = 4.55_f32;
+    let i0_beta = i0(beta);
+
+    let mut taps = [0.0_f32; N];
+    for n in 0..N {
+        let m     = n as f32 - MID as f32;
+        // Ideal bandpass impulse response.
+        let ideal = if m == 0.0 {
+            2.0 * (f_hi - f_lo)
+        } else {
+            let pm  = std::f32::consts::PI * m;
+            ((2.0 * f_hi * pm).sin() - (2.0 * f_lo * pm).sin()) / pm
+        };
+        // Kaiser window.
+        let r = m / MID as f32;
+        let w = i0(beta * (1.0 - r * r).max(0.0).sqrt()) / i0_beta;
+        taps[n] = ideal * w;
+    }
+
+    // Direct convolution, centred (aligns output with input, zero-padded edges).
+    let l    = samples.len();
+    let mut out = vec![0.0_f32; l];
+    for i in 0..l {
+        let mut s = 0.0_f32;
+        let k_min = MID.saturating_sub(i);
+        let k_max = (MID + l - i).min(N);
+        for k in k_min..k_max {
+            let idx = i + k - MID;
+            s += taps[k] * samples[idx];
+        }
+        out[i] = s;
+    }
+    out
+}
 
 /// Soft-clip (tanh) PAPR reduction.
 ///
