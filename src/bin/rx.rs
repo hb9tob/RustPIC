@@ -267,7 +267,7 @@ fn main() {
         }
 
         // Prepare frame receiver.
-        let mut rx       = FrameReceiver::new(&header, &sync.channel_est, 0.1);
+        let mut rx       = FrameReceiver::new(&header, &sync.channel_est, 0.3);
         let n_expected   = rx.expected_symbol_count();
         let total_data   = rx.total_data_syms();
         let pkts_this    = {
