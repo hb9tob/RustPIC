@@ -93,18 +93,13 @@ jobs:
 
             **Encode a file into a WAV (callsign is required):**
             ```
-            tx --input photo.jpg --output photo.wav --callsign HB9TOB --mod 16qam --rate 3/4
+            tx --input photo.jpg --output photo.wav --callsign HB9TOB --mod 64qam --rate 3/4
             ```
-            Re-sync ZC is **on by default** — add `--no-resync` only if you need the
-            smallest possible file size.
 
             **Decode a WAV — every transmission found inside is written out:**
             ```
             rx --input recording.wav --outdir .
             ```
-
-            A short beacon at the start of each transmission activates VOX and sends
-            the callsign, file name and mode before the data begins.
 
             ### OFDM parameters
 
