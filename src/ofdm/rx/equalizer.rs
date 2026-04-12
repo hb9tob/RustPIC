@@ -421,6 +421,11 @@ impl ScatteredEqualizer {
         Self::from_initial(&vec![Complex32::new(1.0, 0.0); NUM_CARRIERS], alpha)
     }
 
+    /// Returns the current channel estimate H[k] for carrier k.
+    pub fn h_at(&self, k: usize) -> Complex32 {
+        self.h[k]
+    }
+
     pub fn set_timing_drift_per_sym(&mut self, drift: f32) {
         self.timing_drift_per_sym = drift;
     }

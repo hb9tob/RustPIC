@@ -214,13 +214,13 @@ fn main() {
         let hdr_start = frame_start + RUNIN_PREAMBLE_SYMS * SYMBOL_LEN;
         let first_data_pos = frame_start + PREAMBLE_SYMS * SYMBOL_LEN;
 
-        // ── CFO correction ─────────────────────────────────────────────────
-        if hdr_start + MODE_HEADER_REPEAT * SYMBOL_LEN > audio.len() {
+        // ── CFO correction on the full frame (RUNIN + header + data) ─────
+        if first_data_pos + SYMBOL_LEN > audio.len() {
             search_start = ps.symbol_pos + SYMBOL_LEN;
             continue;
         }
         let frame_end = (first_data_pos + 300 * SYMBOL_LEN).min(audio.len());
-        let mut buf: Vec<Complex32> = audio[hdr_start..frame_end].to_vec();
+        let mut buf: Vec<Complex32> = audio[frame_start..frame_end].to_vec();
         if ps.cfo_hz.abs() > 0.1 {
             let omega = -2.0 * std::f32::consts::PI * ps.cfo_hz / SAMPLE_RATE;
             for (i, s) in buf.iter_mut().enumerate() {
@@ -229,17 +229,29 @@ fn main() {
             }
         }
 
-        // Decode mode header — QPSK with scattered pilots, through the equalizer.
+        // ── Equalizer warm-up: feed RUNIN preamble + mode header ─────────
+        // The 10 RUNIN preamble symbols have scattered pilots → the equalizer
+        // converges on the real channel response BEFORE we decode the mode
+        // header or any data.  This is the key to surviving NBFM channels.
         use rustpic::ofdm::rx::equalizer::ScatteredEqualizer;
-        let mut hdr_eq = ScatteredEqualizer::from_initial(&ps.channel_est, 0.5);
+        let mut eq = ScatteredEqualizer::from_initial(&ps.channel_est, 0.3);
 
+        // Feed RUNIN preamble (10 symbols with pilots, dummy data)
+        for i in 0..RUNIN_PREAMBLE_SYMS {
+            let off = i * SYMBOL_LEN;
+            if off + SYMBOL_LEN > buf.len() { break; }
+            let _ = eq.process(&buf[off..off + SYMBOL_LEN], i);
+        }
+
+        // Decode mode header with the now-converged equalizer
+        let hdr_offset = RUNIN_PREAMBLE_SYMS * SYMBOL_LEN;
         let mut eq_data_vecs: Vec<Vec<Complex32>> = Vec::new();
         for r in 0..MODE_HEADER_REPEAT {
-            let off = r * SYMBOL_LEN;
+            let off = hdr_offset + r * SYMBOL_LEN;
             if off + SYMBOL_LEN > buf.len() { break; }
             let sym_idx = RUNIN_PREAMBLE_SYMS + r;
-            let eq = hdr_eq.process(&buf[off..off + SYMBOL_LEN], sym_idx);
-            eq_data_vecs.push(eq.data);
+            let result = eq.process(&buf[off..off + SYMBOL_LEN], sym_idx);
+            eq_data_vecs.push(result.data);
         }
         let eq_refs: Vec<&[Complex32]> = eq_data_vecs.iter().map(|v| v.as_slice()).collect();
         let header = match decode_mode_header_from_eq(&eq_refs) {
@@ -255,7 +267,12 @@ fn main() {
             tx_rx = Some(TransmissionReceiver::new(header.total_packet_count, rs_k));
         }
 
-        let mut rx = FrameReceiver::new(&header, &ps.channel_est, 0.3);
+        // Create FrameReceiver with the converged channel estimate from
+        // the equalizer (not the raw pilot_sync estimate).
+        let converged_h: Vec<Complex32> = (0..rustpic::ofdm::params::NUM_CARRIERS)
+            .map(|k| eq.h_at(k))
+            .collect();
+        let mut rx = FrameReceiver::new(&header, &converged_h, 0.3);
         let n_expected   = rx.expected_symbol_count();
         let pkts_this    = {
             let remaining = header.total_packet_count
@@ -265,8 +282,8 @@ fn main() {
         };
 
         // Symbol-by-symbol processing — simple sequential, no resync ZCs.
-        // Offsets are relative to buf (which starts at hdr_start).
-        let data_offset_in_buf = MODE_HEADER_REPEAT * SYMBOL_LEN;
+        // Offsets are relative to buf (which starts at frame_start).
+        let data_offset_in_buf = PREAMBLE_SYMS * SYMBOL_LEN;
         let mut frame_result = None;
         for i in 0..n_expected {
             let sym_pos = data_offset_in_buf + i * SYMBOL_LEN;

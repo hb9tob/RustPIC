@@ -144,8 +144,10 @@ pub const SYMBOLS_PER_SUPERFRAME: usize = SYMBOLS_PER_FRAME * FRAMES_PER_SUPERFR
 pub const HEADER_REPEAT_SYMS: usize = 2 * SYMBOLS_PER_FRAME; // 30
 
 /// Number of pilot-bearing dummy OFDM symbols before the mode header.
-/// Warms up the RX Hilbert filter and lets pilot sync detect the frame.
-pub const RUNIN_PREAMBLE_SYMS: usize = 10;
+/// Warms up the RX Hilbert filter, lets pilot sync detect the frame, and
+/// gives the 2D channel estimator 8 full pilot cycles to converge on the
+/// real channel response before data begins.  QSSTV uses 24.
+pub const RUNIN_PREAMBLE_SYMS: usize = 24;
 
 /// Number of pilot-bearing dummy symbols after the EOT.
 /// Flushes the RX Hilbert filter and keeps the equaliser stable.
