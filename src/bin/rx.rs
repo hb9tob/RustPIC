@@ -18,7 +18,7 @@ use rustpic::{
                 max_packets_per_frame,
             },
             mode_detect::{decode_mode_header_repeated, LdpcRate, ModeHeader, Modulation},
-            sync::{correct_cfo, find_resync_zc, ZcCorrelator},
+            sync::{correct_cfo, estimate_cfo, find_resync_zc, ZcCorrelator},
         },
     },
 };
@@ -162,15 +162,31 @@ fn main() {
 
         // CFO correction on a working copy starting at the preamble.
         let mut buf: Vec<Complex32> = audio[abs_preamble..].to_vec();
-        correct_cfo(&mut buf, sync.cfo_hz);
+        let mut cfo = sync.cfo_hz;
 
-        // Decode mode header — read MODE_HEADER_REPEAT identical copies and
-        // soft-combine them for ~√N SNR gain before the CRC-10 check.
+        // When the sync used the soft-fallback (ZC#2 weak → CFO set to 0),
+        // estimate CFO from the MODE_HEADER_REPEAT identical copies instead:
+        // the phase rotation between consecutive copies IS the per-symbol CFO.
+        // This saves 64-QAM from phase-drift death when the preamble ZC#2
+        // was corrupted by a channel hit.
         let hdr_rel = sync.header_start - sync.preamble_start;
         if hdr_rel + MODE_HEADER_REPEAT * SYMBOL_LEN > buf.len() {
             search_start += SYMBOL_LEN;
             continue;
         }
+        if sync.cfo_hz == 0.0 && MODE_HEADER_REPEAT >= 2 {
+            let off1 = hdr_rel;
+            let off2 = hdr_rel + SYMBOL_LEN;
+            if off2 + SYMBOL_LEN <= buf.len() {
+                let sym1 = &buf[off1..off1 + SYMBOL_LEN];
+                let sym2 = &buf[off2..off2 + SYMBOL_LEN];
+                cfo = estimate_cfo(sym1, sym2);
+            }
+        }
+        correct_cfo(&mut buf, cfo);
+
+        // Decode mode header — read MODE_HEADER_REPEAT identical copies and
+        // soft-combine them for ~√N SNR gain before the CRC-10 check.
         let hdr_windows: Vec<&[Complex32]> = (0..MODE_HEADER_REPEAT)
             .map(|r| {
                 let off = hdr_rel + r * SYMBOL_LEN;

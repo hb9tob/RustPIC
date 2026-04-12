@@ -249,7 +249,7 @@ impl ZcCorrelator {
         // amplitude distortion that degrades the time-domain correlation on
         // NBFM channels (pre-emphasis, HPF rolloff, AGC).  If the freq-domain
         // says the ZC is real, we upgrade the metrics.
-        if confirm_metric < SOFT_SYNC_M1_MIN && best_metric >= self.threshold {
+        if confirm_metric < SOFT_SYNC_M2_RELIABLE && best_metric >= self.threshold {
             let fm1 = self.freq_metric(&samples[best_pos..best_pos + SYMBOL_LEN]);
             if fm1 >= 0.75 {
                 best_metric = best_metric.max(fm1);
@@ -260,16 +260,19 @@ impl ZcCorrelator {
             }
         }
 
-        // Soft-sync fallback: if ZC#2 is too weak to confirm but ZC#1 is very
-        // strong (≥ 0.65, well above the nominal 0.35 primary threshold), accept
-        // the detection anyway.  This handles the real-world case where a short
-        // FM click or a narrowband interferer wipes out a single symbol — the
-        // first ZC survives, the second does not.  CFO estimation is skipped
-        // (set to 0) because it needs a clean ZC#2, but the clock-tracking
-        // path and the re-sync ZCs recover timing for subsequent symbols.
+        // Soft-sync fallback: accept the detection when ZC#1 is very strong
+        // (≥ 0.65) but ZC#2 is mediocre — below the "reliable" level of 0.50,
+        // even if it happens to sit above the hard confirm_threshold (0.20).
+        //
+        // On OTA recordings, the ZC#2 slot often gets a random correlation of
+        // 0.25-0.35 with the mode-header content, which passes the 0.20 gate
+        // but gives a bogus CFO and wrong timing.  By detecting this case and
+        // falling back to CFO=0 + ZC#1-only channel estimate, the frame decode
+        // can still succeed.
         const SOFT_SYNC_M1_MIN: f32 = 0.65;
-        let soft_sync = confirm_metric < self.confirm_threshold
-            && best_metric >= SOFT_SYNC_M1_MIN;
+        const SOFT_SYNC_M2_RELIABLE: f32 = 0.50;
+        let soft_sync = best_metric >= SOFT_SYNC_M1_MIN
+            && confirm_metric < SOFT_SYNC_M2_RELIABLE;
 
         if confirm_metric < self.confirm_threshold && !soft_sync {
             return Err(SyncError::ConfirmationFailed {
