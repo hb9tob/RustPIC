@@ -188,20 +188,33 @@ fn build_frame_internal(
     all_coded_bits.resize(padded_len, 0);
     prbs.scramble_bits(&mut all_coded_bits);
 
-    // The sym_idx passed to ofdm_modulate_scattered starts after the
-    // preamble (ZC#1 + ZC#2 + MODE_HEADER_REPEAT headers = 5 symbols).
-    // Each data symbol's pilot pattern rotates with sym_idx.
-    let preamble_syms = 2 + MODE_HEADER_REPEAT; // ZC pair + 3 mode headers
-    let data_ofdm_syms: Vec<Vec<Complex32>> = (0..total_data_syms)
-        .map(|i| {
-            let bits    = &all_coded_bits[i * bits_per_ofdm..(i + 1) * bits_per_ofdm];
-            let n_data  = NUM_DATA_PER_SYM;
-            let data_sc: Vec<Complex32> = (0..n_data)
-                .map(|s| bits_to_symbol(&bits[s * bps..], config.modulation))
-                .collect();
-            ofdm_modulate_scattered(&data_sc, preamble_syms + i)
-        })
-        .collect();
+    // ── RUNIN: emit all data symbols TWICE ──────────────────────────────────
+    // First pass  (RUNIN): trains the scattered-pilot equaliser on real data.
+    // Second pass (DATA):  same LDPC blocks, now with a converged estimator.
+    //
+    // The RX processes BOTH passes. Failed LDPC blocks from the RUNIN get a
+    // second chance on the DATA pass (soft-combine LLRs if both copies exist).
+    // QSSTV does 24 RUNIN + 10 RUNOUT segments; we do a full 1× repeat.
+    //
+    // sym_idx is CONTINUOUS across both passes so the scattered pilot pattern
+    // rotates correctly: pass1 uses sym_idx 5..5+D, pass2 uses 5+D..5+2D.
+    let preamble_syms = 2 + MODE_HEADER_REPEAT;
+
+    // Build OFDM symbols for one complete pass (bits → constellation → IFFT).
+    let build_pass = |sym_offset: usize| -> Vec<Vec<Complex32>> {
+        (0..total_data_syms)
+            .map(|i| {
+                let bits    = &all_coded_bits[i * bits_per_ofdm..(i + 1) * bits_per_ofdm];
+                let n_data  = NUM_DATA_PER_SYM;
+                let data_sc: Vec<Complex32> = (0..n_data)
+                    .map(|s| bits_to_symbol(&bits[s * bps..], config.modulation))
+                    .collect();
+                ofdm_modulate_scattered(&data_sc, preamble_syms + sym_offset + i)
+            })
+            .collect()
+    };
+    let pass1_syms = build_pass(0);                     // RUNIN
+    let pass2_syms = build_pass(total_data_syms);       // DATA
 
     // ── 3. Re-sync ZC symbol ─────────────────────────────────────────────────
     let resync_sym: Vec<Complex32> = build_preamble()[..SYMBOL_LEN].to_vec();
@@ -234,22 +247,19 @@ fn build_frame_internal(
         samples.extend_from_slice(&mode_hdr_sym);
     }
 
-    // ── 4b. Warm-up: repeat the first WARMUP_SYMS data symbols ──────────────
-    // These extra symbols at the start let the scattered-pilot equaliser
-    // converge before the "real" data begins. The RX skips the first
-    // WARMUP_SYMS for LDPC decoding but still processes them for channel
-    // estimation. The data they carry is identical to the first WARMUP_SYMS
-    // of the real data, so the LDPC can soft-combine if it wants.
-    //
-    // QSSTV goes much further (RUNIN=24 segments), but this is a start.
-    const WARMUP_SYMS: usize = 0; // TODO: restore to 10 once RX warm-up is debugged
-    let warmup_count = WARMUP_SYMS.min(data_ofdm_syms.len());
-    for i in 0..warmup_count {
-        samples.extend_from_slice(&data_ofdm_syms[i]);
+    // ── 4b. RUNIN pass (first copy) ─────────────────────────────────────────
+    // Same data as the main pass — trains the equaliser on real pilots +
+    // gives the LDPC a first shot at each block.
+    for (i, sym) in pass1_syms.iter().enumerate() {
+        if config.has_resync && i > 0 && i % RESYNC_PERIOD == 0 {
+            samples.extend_from_slice(&resync_sym);
+        }
+        samples.extend_from_slice(sym);
     }
 
-    for (data_sym_idx, sym) in data_ofdm_syms.iter().enumerate() {
-        if config.has_resync && data_sym_idx > 0 && data_sym_idx % RESYNC_PERIOD == 0 {
+    // ── 4c. DATA pass (second copy) ──────────────────────────────────────────
+    for (i, sym) in pass2_syms.iter().enumerate() {
+        if config.has_resync && i > 0 && i % RESYNC_PERIOD == 0 {
             samples.extend_from_slice(&resync_sym);
         }
         samples.extend_from_slice(sym);

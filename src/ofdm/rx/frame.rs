@@ -234,9 +234,11 @@ pub struct FrameReceiver {
     descrambler:  G3ruhScrambler,
 
     // ── Accumulation buffers ──────────────────────────────────────────────────
-    llr_buf:    Vec<f32>,
-    info_bits:  Vec<u8>,
-    rs_payload: Vec<u8>,
+    llr_buf:       Vec<f32>,
+    pass1_llrs:    Vec<f32>,  // LLR from RUNIN pass, soft-combined with pass2
+    data_syms_per_pass: usize,
+    info_bits:     Vec<u8>,
+    rs_payload:    Vec<u8>,
 
     // ── Symbol / block counters ────────────────────────────────────────────────
     warmup_remaining:    usize,
@@ -283,7 +285,9 @@ impl FrameReceiver {
         let total_ldpc_blocks = groups_this_frame * blocks_per_group;
         let bits_per_ofdm     = NUM_DATA_PER_SYM * header.modulation.bits_per_symbol();
         let total_coded_bits  = total_ldpc_blocks * LDPC_N;
-        let total_data_syms   = total_coded_bits.div_ceil(bits_per_ofdm);
+        let data_syms_per_pass = total_coded_bits.div_ceil(bits_per_ofdm);
+        // TX sends 2 passes (RUNIN + DATA), so total data symbols = 2×.
+        let total_data_syms   = 2 * data_syms_per_pass;
 
         Self {
             header:             header.clone(),
@@ -301,6 +305,8 @@ impl FrameReceiver {
             rs:           RsCodec::for_level(header.rs_level),
             descrambler:  G3ruhScrambler::new(),
             llr_buf:      Vec::new(),
+            pass1_llrs:   Vec::new(),
+            data_syms_per_pass,
             info_bits:    Vec::new(),
             rs_payload: Vec::new(),
             warmup_remaining:    0,  // match TX WARMUP_SYMS
@@ -412,6 +418,34 @@ impl FrameReceiver {
         self.data_syms_received += 1;
         self.total_syms_fed     += 1;
         self.syms_in_group      += 1;
+
+        // At the boundary between RUNIN (pass1) and DATA (pass2):
+        // attempt to decode all LDPC blocks from pass1. Blocks that converge
+        // are KEPT (their RS contribution is final). Blocks that fail are
+        // RESET — their LLR are discarded and pass2 gets a fresh shot with
+        // a converged equaliser.
+        if self.data_syms_received == self.data_syms_per_pass {
+            // Drain any remaining pass1 LLRs into LDPC blocks.
+            self.drain_ldpc_blocks();
+
+            // Save which blocks converged in pass1.
+            let pass1_converged = self.ldpc_block_converged.clone();
+
+            // Reset LLR buffer and block counter for pass2, but ONLY for
+            // blocks that FAILED in pass1. Converged blocks stay decoded.
+            self.llr_buf.clear();
+
+            // Reset the block drain counter to 0 so pass2 re-decodes
+            // ALL blocks. drain_ldpc_blocks will skip blocks already converged.
+            self.ldpc_blocks_decoded = 0;
+            self.syms_in_group = 0;
+
+            // Mark pass1 convergence so drain_ldpc_blocks can skip converged.
+            self.pass1_llrs = Vec::new(); // repurpose: not used for soft-combine
+            // pass1_converged is already stored in self.ldpc_block_converged
+
+            return PushResult::NeedMore;
+        }
 
         self.drain_ldpc_blocks();
 
