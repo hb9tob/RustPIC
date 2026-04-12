@@ -319,12 +319,13 @@ pub fn decode_mode_header_from_eq(
         return Err(ModeError::BadFftWindowLen { got: 0 });
     }
 
-    // Soft-combine across repetitions.
-    let n_data = eq_data[0].len();
+    // Soft-combine across repetitions (may have different lengths due to
+    // varying pilot count per symbol phase).
+    let n_data = eq_data.iter().map(|r| r.len()).min().unwrap_or(0);
     let mut combined = vec![Complex32::new(0.0, 0.0); n_data];
     for rep in eq_data {
-        for (i, &c) in rep.iter().enumerate() {
-            combined[i] += c;
+        for i in 0..n_data {
+            combined[i] += rep[i];
         }
     }
 

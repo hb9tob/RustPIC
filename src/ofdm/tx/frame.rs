@@ -202,12 +202,22 @@ fn build_frame_internal(
     let build_pass = |sym_offset: usize| -> Vec<Vec<Complex32>> {
         (0..total_data_syms)
             .map(|i| {
+                let sym_idx = preamble_syms + sym_offset + i;
+                let n_data  = crate::ofdm::drm_pilots::drm_num_data(sym_idx);
                 let bits    = &all_coded_bits[i * bits_per_ofdm..(i + 1) * bits_per_ofdm];
-                let n_data  = NUM_DATA_PER_SYM;
+                // n_data may exceed NUM_DATA_PER_SYM by 1 for some sym phases;
+                // extra carriers get zero-padded.
                 let data_sc: Vec<Complex32> = (0..n_data)
-                    .map(|s| bits_to_symbol(&bits[s * bps..], config.modulation))
+                    .map(|s| {
+                        let bit_start = s * bps;
+                        if bit_start + bps <= bits.len() {
+                            bits_to_symbol(&bits[bit_start..], config.modulation)
+                        } else {
+                            Complex32::new(0.0, 0.0) // padding
+                        }
+                    })
                     .collect();
-                ofdm_modulate_scattered(&data_sc, preamble_syms + sym_offset + i)
+                ofdm_modulate_scattered(&data_sc, sym_idx)
             })
             .collect()
     };

@@ -72,14 +72,14 @@ pub const SUBCARRIER_SPACING: f32 = SAMPLE_RATE / FFT_SIZE as f32; // 46.875 Hz
 pub const FIRST_BIN: usize = 18;
 
 /// Total number of active subcarriers (data + pilots).
-/// Covers bins 18 … 41  (≈ 844 Hz … 1922 Hz).
-/// Reduced from 42 to 24 to stay within the flat region of the NBFM
-/// audio passband measured OTA.  This sacrifices throughput for
-/// reliable 64-QAM decode on FM repeater channels.
-pub const NUM_CARRIERS: usize = 24;
+/// Covers bins 18 … 51  (≈ 844 Hz … 2390 Hz).
+/// FIRST_BIN=18 skips the HPF dead zone (< 800 Hz).
+/// 34 carriers give 5-6 pilots/symbol — enough for the 2D channel
+/// estimator to track the NBFM frequency-selective channel.
+pub const NUM_CARRIERS: usize = 34;
 
-/// FFT bin index of the last active subcarrier (inclusive), ≈ 1922 Hz.
-pub const LAST_BIN: usize = FIRST_BIN + NUM_CARRIERS - 1; // 41
+/// FFT bin index of the last active subcarrier (inclusive), ≈ 2390 Hz.
+pub const LAST_BIN: usize = FIRST_BIN + NUM_CARRIERS - 1; // 51
 
 // ── Scattered pilots (DRM Mode B style) ──────────────────────────────────────
 //
@@ -316,7 +316,7 @@ mod tests {
         let f_last  = carrier_to_bin(NUM_CARRIERS - 1) as f32 * SUBCARRIER_SPACING;
         assert!((f_first - 843.75).abs() < 0.1,
             "first carrier should be ~844 Hz, got {f_first}");
-        assert!((f_last  - 1921.875).abs() < 0.1,
-            "last carrier should be ~1922 Hz, got {f_last}");
+        assert!((f_last  - 2390.625).abs() < 0.1,
+            "last carrier should be ~2391 Hz, got {f_last}");
     }
 }

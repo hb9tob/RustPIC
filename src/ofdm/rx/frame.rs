@@ -400,7 +400,11 @@ impl FrameReceiver {
                 mean_amp, mean_re, mean_im, mean_re / (mean_im + 1e-9));
         }
 
-        let llrs = demap(&eq.data, &eq.noise_var, self.header.modulation);
+        let mut llrs = demap(&eq.data, &eq.noise_var, self.header.modulation);
+        // Truncate to bits_per_ofdm: some symbols have 1 extra data carrier
+        // due to the scattered pilot pattern (e.g. 29 vs 28 data carriers).
+        let bits_per_ofdm = NUM_DATA_PER_SYM * self.header.modulation.bits_per_symbol();
+        llrs.truncate(bits_per_ofdm);
         self.data_syms_received += 1;
         self.total_syms_fed     += 1;
         self.syms_in_group      += 1;
