@@ -494,6 +494,8 @@ impl ScatteredEqualizer {
         };
 
         let mut pilot_err2 = 0.0_f32;
+        let mut pilot_err2_strong = 0.0_f32;
+        let mut n_strong = 0_u32;
         for &k in &pilot_positions {
             let expected = drm_pilot_value(k, sym_idx);
             let h_meas = y[k] / expected;
@@ -504,7 +506,15 @@ impl ScatteredEqualizer {
             // Pilot residual for SNR estimation
             let eq_pilot = y[k] * zf(self.h[k]);
             let err = eq_pilot - expected;
-            pilot_err2 += err.norm_sqr();
+            let err2 = err.norm_sqr();
+            pilot_err2 += err2;
+
+            // Track strong pilots separately (|H| > -10 dB = 0.1 power).
+            // Weak pilots inflate the noise estimate and poison all LLRs.
+            if self.h[k].norm_sqr() > 0.1 {
+                pilot_err2_strong += err2;
+                n_strong += 1;
+            }
         }
         let n_pilots = pilot_positions.len() as f32;
         let mean_pilot_err2 = pilot_err2 / n_pilots.max(1.0);
@@ -606,9 +616,14 @@ impl ScatteredEqualizer {
 
         // ── 6. MMSE equalisation — data subcarriers only ─────────────────
         // MMSE: x̂ = conj(H)·y / (|H|² + σ²_n)
-        // Better than ZF at low SNR: avoids noise amplification in faded carriers.
-        // σ²_n estimated from pilot residuals (same as QSSTV's MIN_ABS_H floor).
-        let sigma2_noise = mean_pilot_err2.max(1e-6);
+        // σ²_n from STRONG pilots only — weak pilots (near HPF/LPF edge)
+        // have large equalization errors that would inflate σ² and poison
+        // the LLRs of ALL carriers.
+        let sigma2_noise = if n_strong >= 3 {
+            (pilot_err2_strong / n_strong as f32).max(1e-6)
+        } else {
+            mean_pilot_err2.max(1e-6)
+        };
 
         let mut data = Vec::with_capacity(drm_num_data(sym_idx));
         let mut noise_var = Vec::with_capacity(drm_num_data(sym_idx));

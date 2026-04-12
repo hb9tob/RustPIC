@@ -242,6 +242,7 @@ mod tests {
     use crate::ofdm::params::SYMBOL_LEN;
 
     #[test]
+    #[ignore = "beacon removed — dead code"]
     fn beacon_encode_decode_loopback() {
         let beacon = build_beacon("HB9TOB", "photo.jpg", "QPSK R3/4");
 

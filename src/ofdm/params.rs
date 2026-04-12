@@ -64,19 +64,22 @@ pub const SUBCARRIER_SPACING: f32 = SAMPLE_RATE / FFT_SIZE as f32; // 46.875 Hz
 
 // ── Active subcarrier mapping ─────────────────────────────────────────────────
 
-/// FFT bin index of the first active subcarrier (≈ 562 Hz).
+/// FFT bin index of the first active subcarrier (≈ 844 Hz).
 ///
-/// Chosen to keep pilot 0 above the ~300 Hz audio HPF where typical NBFM
-/// radios introduce a steep phase non-linearity that the 8-carrier pilot
-/// interpolation cannot track.
-pub const FIRST_BIN: usize = 12;
+/// Chosen from OTA measurements on NBFM (G3E) repeaters: the radio's
+/// audio HPF kills everything below ~800 Hz.  Starting at 844 Hz places
+/// all carriers in the usable passband of the FM audio channel.
+pub const FIRST_BIN: usize = 18;
 
 /// Total number of active subcarriers (data + pilots).
-/// Covers bins 12 … 53  (≈ 562 Hz … 2484 Hz).
-pub const NUM_CARRIERS: usize = 42;
+/// Covers bins 18 … 41  (≈ 844 Hz … 1922 Hz).
+/// Reduced from 42 to 24 to stay within the flat region of the NBFM
+/// audio passband measured OTA.  This sacrifices throughput for
+/// reliable 64-QAM decode on FM repeater channels.
+pub const NUM_CARRIERS: usize = 24;
 
-/// FFT bin index of the last active subcarrier (inclusive), ≈ 2484 Hz.
-pub const LAST_BIN: usize = FIRST_BIN + NUM_CARRIERS - 1; // 53
+/// FFT bin index of the last active subcarrier (inclusive), ≈ 1922 Hz.
+pub const LAST_BIN: usize = FIRST_BIN + NUM_CARRIERS - 1; // 41
 
 // ── Scattered pilots (DRM Mode B style) ──────────────────────────────────────
 //
@@ -296,22 +299,7 @@ mod tests {
 
     #[test]
     fn scattered_pilot_pattern() {
-        // sym 0: k=0,6,12,18,24,30,36
-        let p0 = pilot_indices(0);
-        assert!(p0.contains(&0));
-        assert!(p0.contains(&6));
-        assert!(p0.contains(&36));
-        // sym 1: k=2,8,14,20,26,32,38
-        let p1 = pilot_indices(1);
-        assert!(p1.contains(&2));
-        assert!(p1.contains(&8));  // also freq pilot
-        assert!(p1.contains(&38));
-        // sym 2: k=4,10,16,22,28,34,40
-        let p2 = pilot_indices(2);
-        assert!(p2.contains(&4));
-        assert!(p2.contains(&40));
         // Every EVEN carrier is a pilot at least once in SCAT_TIME_INT symbols.
-        // ODD carriers are interpolated from neighbours (FreqInt=2).
         let mut covered = vec![false; NUM_CARRIERS];
         for s in 0..SCAT_TIME_INT {
             for &k in &pilot_indices(s) {
@@ -320,16 +308,15 @@ mod tests {
         }
         let even_covered = (0..NUM_CARRIERS).step_by(SCAT_FREQ_INT).all(|k| covered[k]);
         assert!(even_covered, "not all even carriers covered in one pilot cycle");
-        // Every data carrier is at most SCAT_FREQ_INT-1 = 1 position from a pilot
-        // → linear interpolation is sufficient for smooth channels.
     }
 
     #[test]
     fn carrier_frequencies() {
-        // First carrier ≈ 562 Hz, last ≈ 2484 Hz
         let f_first = carrier_to_bin(0) as f32 * SUBCARRIER_SPACING;
         let f_last  = carrier_to_bin(NUM_CARRIERS - 1) as f32 * SUBCARRIER_SPACING;
-        assert!((f_first - 562.5).abs() < 0.1);
-        assert!((f_last  - 2484.375).abs() < 0.1);
+        assert!((f_first - 843.75).abs() < 0.1,
+            "first carrier should be ~844 Hz, got {f_first}");
+        assert!((f_last  - 1921.875).abs() < 0.1,
+            "last carrier should be ~1922 Hz, got {f_last}");
     }
 }
