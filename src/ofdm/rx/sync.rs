@@ -566,9 +566,9 @@ pub fn channel_estimate_from_zc(fft_window: &[Complex32]) -> Vec<Complex32> {
     (0..NUM_CARRIERS)
         .map(|k| {
             let y = buf[carrier_to_bin(k)] * scale;
-            let x = zc_ref[k]; // |x| = 1 (CAZAC)
-            // H = Y / X = Y · X*  (since |X|² = 1)
-            y * x.conj()
+            let x = zc_ref[k];
+            // H = Y / X = Y · X* / |X|²
+            y * x.conj() / x.norm_sqr()
         })
         .collect()
 }

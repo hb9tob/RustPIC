@@ -44,17 +44,27 @@ pub fn generate_zc(root: u32, length: usize) -> Vec<Complex32> {
 
 // ── Preamble construction ─────────────────────────────────────────────────────
 
+/// Amplitude gain applied to the ZC preamble in both the TX time-domain
+/// symbol and the RX frequency-domain reference. Scaling the ZC up from
+/// its natural CAZAC amplitude brings the preamble's peak closer to the
+/// data symbols' peak, smoothing the envelope at the ANN → ZC and ZC →
+/// mode-header boundaries.  Without this, the ZC's peak is ~2× lower than
+/// data (PAPR 6.6 dB vs 10–12 dB at matched RMS), creating a brutal
+/// amplitude step that the FM radio's AGC/limiter sees as a broadband click.
+///
+/// Crucially, the **same gain** is applied in `zc_freq_reference()` so the
+/// channel estimate `H[k] = Y_rx[k] / (G · ZC[k])` cancels the scaling and
+/// remains an unbiased estimate of the true channel.  The higher amplitude
+/// also improves the channel estimate's SNR by a factor of G.
+pub const ZC_GAIN: f32 = 1.0;
+
 /// Builds the time-domain ZC preamble OFDM symbol **including** the cyclic
 /// prefix (total length [`SYMBOL_LEN`]).
-///
-/// Steps:
-/// 1. Generate ZC of length [`ZC_LEN`] in the frequency domain.
-/// 2. Zero-pad to [`FFT_SIZE`] and place on active subcarriers.
-/// 3. IFFT → time domain.
-/// 4. Prepend CP (last [`CP_LEN`] samples of the FFT window).
-/// 5. Normalise to unit average power.
 pub fn build_preamble() -> Vec<Complex32> {
-    let zc = generate_zc(ZC_ROOT, ZC_LEN);
+    let zc: Vec<Complex32> = generate_zc(ZC_ROOT, ZC_LEN)
+        .into_iter()
+        .map(|s| s * ZC_GAIN)
+        .collect();
     zc_freq_to_time_domain(&zc)
 }
 
@@ -101,6 +111,9 @@ pub(crate) fn zc_freq_to_time_domain(zc: &[Complex32]) -> Vec<Complex32> {
 /// ```
 pub fn zc_freq_reference() -> Vec<Complex32> {
     generate_zc(ZC_ROOT, ZC_LEN)
+        .into_iter()
+        .map(|s| s * ZC_GAIN)
+        .collect()
 }
 
 // ── Conjugate root (for cross-correlation kernel) ─────────────────────────────
