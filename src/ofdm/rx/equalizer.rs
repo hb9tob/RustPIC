@@ -303,6 +303,14 @@ impl SymbolEqualizer {
 /// Sets to 0 in deep fades (|H|² < 1e-6) to avoid catastrophic noise
 /// amplification — the LDPC treats those as erasures (LLR ≈ 0).
 #[inline(always)]
+/// Normalised sinc function: sinc(x) = sin(πx)/(πx), sinc(0) = 1.
+fn sinc(x: f32) -> f32 {
+    if x.abs() < 1e-6 { 1.0 } else {
+        let px = std::f32::consts::PI * x;
+        px.sin() / px
+    }
+}
+
 fn zf(h: Complex32) -> Complex32 {
     let h_sq = h.norm_sqr();
     if h_sq > 1e-6 { h.conj() / h_sq } else { Complex32::new(0.0, 0.0) }
@@ -369,6 +377,9 @@ fn interpolate(pilot_h: &[Complex32]) -> Vec<Complex32> {
 /// temporal EMA smoothing across symbols. Because pilots are at every 2nd
 /// carrier (SCAT_FREQ_INT = 2), the frequency interpolation gap is only 1
 /// carrier — dramatically more accurate than the old 8-carrier fixed spacing.
+/// One pilot measurement: (carrier_index, H_measured).
+type PilotMeas = (usize, Complex32);
+
 pub struct ScatteredEqualizer {
     /// Full per-carrier channel estimate H[k], EMA-smoothed across symbols.
     h: Vec<Complex32>,
@@ -378,17 +389,30 @@ pub struct ScatteredEqualizer {
     timing_drift_per_sym: f32,
     /// Symbol counter since last resync / init.
     syms_processed: usize,
+    /// Ring buffer of pilot H measurements from past symbols for 2D interpolation.
+    /// Each entry = (sym_idx_in_buffer, Vec<(carrier_k, H_measured)>).
+    /// We keep SCAT_TIME_INT (=3) symbols — one full pilot cycle covers all carriers.
+    pilot_buf: Vec<Vec<PilotMeas>>,
+    /// 2D sinc cutoff frequencies (from QSSTV/DRM).
+    f_cut_k: f32,
+    f_cut_t: f32,
 }
 
 impl ScatteredEqualizer {
     /// Create from an initial per-carrier channel estimate (e.g. from ZC preamble).
     pub fn from_initial(h_init: &[Complex32], alpha: f32) -> Self {
         assert_eq!(h_init.len(), NUM_CARRIERS);
+        // 2D sinc cutoff frequencies (QSSTV: f_cut_k = 1.75*Tg/Tu, f_cut_t = 0.0675/y)
+        let f_cut_k = 1.75 * CP_LEN as f32 / FFT_SIZE as f32; // 0.4375
+        let f_cut_t = 0.0675 / SCAT_TIME_INT as f32;           // 0.0225
         Self {
             h: h_init.to_vec(),
             alpha: alpha.clamp(1e-4, 1.0),
             timing_drift_per_sym: 0.0,
             syms_processed: 0,
+            pilot_buf: Vec::with_capacity(SCAT_TIME_INT + 1),
+            f_cut_k,
+            f_cut_t,
         }
     }
 
@@ -406,6 +430,7 @@ impl ScatteredEqualizer {
         assert_eq!(h_new.len(), NUM_CARRIERS);
         self.h = h_new.to_vec();
         self.syms_processed = 0;
+        self.pilot_buf.clear();
     }
 
     /// Equalise one OFDM symbol with scattered pilots.
@@ -480,24 +505,32 @@ impl ScatteredEqualizer {
         let mean_pilot_err2 = pilot_err2 / n_pilots.max(1.0);
         let pilot_snr_db = -10.0 * mean_pilot_err2.max(1e-10).log10();
 
-        // ── 5. Frequency interpolation for non-pilot carriers ───────────────
-        // With SCAT_FREQ_INT=2, every non-pilot carrier is exactly 1 position
-        // away from a pilot. Simple linear interpolation between the two
-        // nearest pilot-updated H values.
-        //
-        // Build sorted pilot positions for this symbol, then interpolate.
-        let mut h_interp = self.h.clone();
-        {
+        // ── 5. Store current pilots in the time buffer ─────────────────────
+        let current_pilots: Vec<PilotMeas> = pilot_positions.iter()
+            .map(|&k| (k, self.h[k]))
+            .collect();
+        self.pilot_buf.push(current_pilots);
+        // Keep only the last SCAT_TIME_INT+1 symbols (4 symbols for overlap)
+        while self.pilot_buf.len() > SCAT_TIME_INT + 1 {
+            self.pilot_buf.remove(0);
+        }
+
+        // ── 6. 2D channel interpolation (time + frequency) ─────────────
+        // Use all pilot measurements from the time buffer to estimate H
+        // at every carrier.  Weight by 2D sinc kernel (QSSTV approach):
+        //   w(Δk, Δt) = sinc(Δk · f_cut_k) · sinc(Δt · f_cut_t)
+        let mut h_interp = vec![Complex32::new(0.0, 0.0); NUM_CARRIERS];
+
+        if self.pilot_buf.len() < SCAT_TIME_INT || self.syms_processed <= CONVERGENCE_SYMS {
+            // Not enough history or still converging — fall back to 1D frequency
+            // interpolation from current symbol's pilots.
+            h_interp = self.h.clone();
             let mut ppos: Vec<usize> = pilot_positions.clone();
             ppos.sort();
-
             for k in 0..NUM_CARRIERS {
                 if is_drm_pilot(k, sym_idx) { continue; }
-
-                // Find the nearest pilot below and above
                 let below = ppos.iter().rev().find(|&&p| p < k).copied();
                 let above = ppos.iter().find(|&&p| p > k).copied();
-
                 h_interp[k] = match (below, above) {
                     (Some(lo), Some(hi)) => {
                         let t = (k - lo) as f32 / (hi - lo) as f32;
@@ -507,11 +540,55 @@ impl ScatteredEqualizer {
                     (None, Some(hi)) => self.h[hi],
                     (None, None) => Complex32::new(1.0, 0.0),
                 };
+            }
+        } else {
+            // 2D interpolation from all stored pilot measurements.
+            let n_buf = self.pilot_buf.len();
+            for k in 0..NUM_CARRIERS {
+                let mut sum_w = 0.0_f32;
+                let mut sum_wh = Complex32::new(0.0, 0.0);
 
-                // Also update the stored H for non-pilot positions (for
-                // the temporal EMA to have a baseline next time this carrier
-                // IS a pilot in a future symbol).
-                self.h[k] = h_interp[k];
+                for (t_idx, pilots) in self.pilot_buf.iter().enumerate() {
+                    let dt = (n_buf - 1 - t_idx) as f32; // 0 = current, 1 = previous, ...
+                    for &(pk, ph) in pilots {
+                        let dk = (k as f32 - pk as f32).abs();
+                        let wk = sinc(dk * self.f_cut_k);
+                        let wt = sinc(dt * self.f_cut_t);
+                        let w = wk * wt;
+                        sum_w += w;
+                        sum_wh += ph * w;
+                    }
+                }
+
+                h_interp[k] = if sum_w > 1e-10 {
+                    sum_wh / sum_w
+                } else {
+                    self.h[k]
+                };
+            }
+        }
+
+        // Update stored H only for non-pilot carriers via 1D interpolation
+        // (same as before). The EMA at pilot positions is authoritative;
+        // the 2D h_interp is used ONLY for equalization output, not feedback.
+        // This prevents 2D smoothing artifacts from corrupting the CPE
+        // estimation on long transmissions.
+        {
+            let mut ppos: Vec<usize> = pilot_positions.clone();
+            ppos.sort();
+            for k in 0..NUM_CARRIERS {
+                if is_drm_pilot(k, sym_idx) { continue; }
+                let below = ppos.iter().rev().find(|&&p| p < k).copied();
+                let above = ppos.iter().find(|&&p| p > k).copied();
+                self.h[k] = match (below, above) {
+                    (Some(lo), Some(hi)) => {
+                        let t = (k - lo) as f32 / (hi - lo) as f32;
+                        self.h[lo] * (1.0 - t) + self.h[hi] * t
+                    }
+                    (Some(lo), None) => self.h[lo],
+                    (None, Some(hi)) => self.h[hi],
+                    _ => self.h[k],
+                };
             }
         }
 
