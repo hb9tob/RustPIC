@@ -88,8 +88,18 @@ pub fn scan_for_pilots(
                 }
             }
 
-            // ── Stage 1b: CFO estimation from CP correlation phase ────
-            // arg(Σ r[d+n] · conj(r[d+n+N])) = 2π · Δf · N / fs
+            // ── Stage 1b: Confirm with consecutive CP peaks ─────────
+            // Require at least 2 adjacent symbols with good CP correlation.
+            // This rejects false positives from noise/interference.
+            let cp_next = if best_pos + 2 * SYMBOL_LEN <= samples.len() {
+                cp_correlation(samples, best_pos + SYMBOL_LEN)
+            } else { 0.0 };
+            if cp_next < cp_threshold * 0.8 {
+                d += coarse_step;
+                continue;
+            }
+
+            // ── Stage 1c: CFO estimation from CP correlation phase ────
             let cfo_hz = cp_correlation_cfo(samples, best_pos);
 
             // ── Stage 2: pilot detection at this symbol ─────────────────

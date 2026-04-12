@@ -18,7 +18,7 @@ use rustpic::{
             },
             hilbert::HilbertFilter,
             mode_detect::{decode_mode_header_from_eq, LdpcRate, ModeHeader, Modulation},
-            pilot_sync::scan_for_pilots,
+            pilot_sync::{scan_for_pilots, cp_correlation},
         },
     },
 };
@@ -203,16 +203,13 @@ fn main() {
         }
 
         // Navigate from the detected symbol to the frame start.
-        // The detected symbol has sym_idx in 0..SYMBOLS_PER_FRAME−1.
-        // RUNIN preamble = sym_idx 0..RUNIN_PREAMBLE_SYMS−1
-        // Mode header    = sym_idx RUNIN_PREAMBLE_SYMS..PREAMBLE_SYMS−1
-        // Data           = sym_idx PREAMBLE_SYMS+
-        let frame_start = match ps.symbol_pos.checked_sub(ps.sym_idx * SYMBOL_LEN) {
-            Some(p) => p,
-            None => { search_start = ps.symbol_pos + SYMBOL_LEN; continue; }
-        };
-        let hdr_start = frame_start + RUNIN_PREAMBLE_SYMS * SYMBOL_LEN;
-        let first_data_pos = frame_start + PREAMBLE_SYMS * SYMBOL_LEN;
+        // sym_idx is modulo SYMBOLS_PER_FRAME → ambiguous.  Try each
+        // candidate frame_start (stepping back by SYMBOLS_PER_FRAME)
+        // and pick the one where the mode header QPSK CRC passes.
+        let base_back = ps.sym_idx * SYMBOL_LEN;
+        let mut frame_start = ps.symbol_pos.saturating_sub(base_back);
+        let mut hdr_start = frame_start + RUNIN_PREAMBLE_SYMS * SYMBOL_LEN;
+        let mut first_data_pos = frame_start + PREAMBLE_SYMS * SYMBOL_LEN;
 
         // ── CFO correction on the full frame (RUNIN + header + data) ─────
         if first_data_pos + SYMBOL_LEN > audio.len() {
