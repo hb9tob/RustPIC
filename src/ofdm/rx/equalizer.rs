@@ -354,6 +354,176 @@ fn interpolate(pilot_h: &[Complex32]) -> Vec<Complex32> {
     h
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// ScatteredEqualizer — DRM Mode B scattered-pilot 2D channel estimation
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Channel equaliser using DRM-style scattered pilots.
+///
+/// Instead of fixed pilot positions, each OFDM symbol has pilots at positions
+/// determined by `is_pilot_at(k, sym_idx)`. The pilot positions rotate every
+/// `SCAT_TIME_INT = 3` symbols, covering ALL carriers in one pilot cycle.
+///
+/// Channel estimation is 2D: frequency interpolation within each symbol +
+/// temporal EMA smoothing across symbols. Because pilots are at every 2nd
+/// carrier (SCAT_FREQ_INT = 2), the frequency interpolation gap is only 1
+/// carrier — dramatically more accurate than the old 8-carrier fixed spacing.
+pub struct ScatteredEqualizer {
+    /// Full per-carrier channel estimate H[k], EMA-smoothed across symbols.
+    h: Vec<Complex32>,
+    /// EMA coefficient (0 < α ≤ 1). Higher = faster tracking, noisier.
+    alpha: f32,
+    /// Timing drift in samples per symbol (from resync measurements).
+    timing_drift_per_sym: f32,
+    /// Symbol counter since last resync / init.
+    syms_processed: usize,
+}
+
+impl ScatteredEqualizer {
+    /// Create from an initial per-carrier channel estimate (e.g. from ZC preamble).
+    pub fn from_initial(h_init: &[Complex32], alpha: f32) -> Self {
+        assert_eq!(h_init.len(), NUM_CARRIERS);
+        Self {
+            h: h_init.to_vec(),
+            alpha: alpha.clamp(1e-4, 1.0),
+            timing_drift_per_sym: 0.0,
+            syms_processed: 0,
+        }
+    }
+
+    /// Create with a flat unit channel (for loopback or when no ZC is available).
+    pub fn flat(alpha: f32) -> Self {
+        Self::from_initial(&vec![Complex32::new(1.0, 0.0); NUM_CARRIERS], alpha)
+    }
+
+    pub fn set_timing_drift_per_sym(&mut self, drift: f32) {
+        self.timing_drift_per_sym = drift;
+    }
+
+    /// Re-seed the channel estimate from a ZC or known reference.
+    pub fn resync(&mut self, h_new: &[Complex32]) {
+        assert_eq!(h_new.len(), NUM_CARRIERS);
+        self.h = h_new.to_vec();
+        self.syms_processed = 0;
+    }
+
+    /// Equalise one OFDM symbol with scattered pilots.
+    ///
+    /// `sym_idx` determines which carriers are pilots (via `is_pilot_at`).
+    /// Returns the equalized data carriers (skipping pilot positions) and
+    /// per-carrier noise variance estimates.
+    pub fn process(&mut self, ofdm_symbol: &[Complex32], sym_idx: usize) -> EqualizedSymbol {
+        assert_eq!(ofdm_symbol.len(), SYMBOL_LEN);
+
+        // ── 1. Strip CP, FFT → Y[k] ─────────────────────────────────────────
+        let fft_window = &ofdm_symbol[CP_LEN..];
+        let mut y = ofdm_demodulate(fft_window);
+
+        // ── 2. Clock-drift phase pre-correction ─────────────────────────────
+        let drift = (self.syms_processed as f32 + 1.0) * self.timing_drift_per_sym;
+        if drift.abs() > 1e-9 {
+            use std::f32::consts::PI;
+            for k in 0..NUM_CARRIERS {
+                let phi = 2.0 * PI * drift * carrier_to_bin(k) as f32 / FFT_SIZE as f32;
+                y[k] *= Complex32::new(phi.cos(), -phi.sin());
+            }
+        }
+        self.syms_processed += 1;
+
+        // ── 3. CPE (Common Phase Error) removal from pilots ─────────────────
+        let pilot_positions = pilot_indices(sym_idx);
+        let cpe: f32 = {
+            let sum: Complex32 = pilot_positions.iter()
+                .map(|&k| {
+                    let expected = pilot_value(k, sym_idx);
+                    let h_meas = y[k] / expected;
+                    h_meas * self.h[k].conj()
+                })
+                .fold(Complex32::new(0.0, 0.0), |a, v| a + v);
+            sum.arg()
+        };
+        if cpe.abs() > 0.05 {
+            let corr = Complex32::from_polar(1.0, -cpe);
+            for k in 0..NUM_CARRIERS {
+                y[k] *= corr;
+            }
+        }
+
+        // ── 4. Measure H at pilot positions, EMA update ─────────────────────
+        let mut pilot_err2 = 0.0_f32;
+        for &k in &pilot_positions {
+            let expected = pilot_value(k, sym_idx);
+            let h_meas = y[k] / expected;
+
+            // EMA update at this carrier
+            self.h[k] = self.h[k] * (1.0 - self.alpha) + h_meas * self.alpha;
+
+            // Pilot residual for SNR estimation
+            let eq_pilot = y[k] * zf(self.h[k]);
+            let err = eq_pilot - expected;
+            pilot_err2 += err.norm_sqr();
+        }
+        let n_pilots = pilot_positions.len() as f32;
+        let mean_pilot_err2 = pilot_err2 / n_pilots.max(1.0);
+        let pilot_snr_db = -10.0 * mean_pilot_err2.max(1e-10).log10();
+
+        // ── 5. Frequency interpolation for non-pilot carriers ───────────────
+        // With SCAT_FREQ_INT=2, every non-pilot carrier is exactly 1 position
+        // away from a pilot. Simple linear interpolation between the two
+        // nearest pilot-updated H values.
+        //
+        // Build sorted pilot positions for this symbol, then interpolate.
+        let mut h_interp = self.h.clone();
+        {
+            let mut ppos: Vec<usize> = pilot_positions.clone();
+            ppos.sort();
+
+            for k in 0..NUM_CARRIERS {
+                if is_pilot_at(k, sym_idx) { continue; }
+
+                // Find the nearest pilot below and above
+                let below = ppos.iter().rev().find(|&&p| p < k).copied();
+                let above = ppos.iter().find(|&&p| p > k).copied();
+
+                h_interp[k] = match (below, above) {
+                    (Some(lo), Some(hi)) => {
+                        let t = (k - lo) as f32 / (hi - lo) as f32;
+                        self.h[lo] * (1.0 - t) + self.h[hi] * t
+                    }
+                    (Some(lo), None) => self.h[lo],
+                    (None, Some(hi)) => self.h[hi],
+                    (None, None) => Complex32::new(1.0, 0.0),
+                };
+
+                // Also update the stored H for non-pilot positions (for
+                // the temporal EMA to have a baseline next time this carrier
+                // IS a pilot in a future symbol).
+                self.h[k] = h_interp[k];
+            }
+        }
+
+        // ── 6. ZF equalisation — data subcarriers only ──────────────────────
+        let mean_h2: f32 = pilot_positions.iter()
+            .map(|&k| self.h[k].norm_sqr())
+            .sum::<f32>() / n_pilots;
+        let sigma2_channel = mean_pilot_err2 * mean_h2;
+
+        let mut data = Vec::with_capacity(num_data_at(sym_idx));
+        let mut noise_var = Vec::with_capacity(num_data_at(sym_idx));
+
+        for k in 0..NUM_CARRIERS {
+            if is_pilot_at(k, sym_idx) { continue; }
+
+            let h_k = h_interp[k];
+            let h_sq = h_k.norm_sqr();
+            data.push(y[k] * zf(h_k));
+            noise_var.push(sigma2_channel / h_sq.max(1e-6));
+        }
+
+        EqualizedSymbol { data, noise_var, pilot_snr_db }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -388,6 +558,64 @@ mod tests {
         sym.extend_from_slice(&time);
         sym
     }
+
+    #[test]
+    fn scattered_eq_flat_channel() {
+        use crate::ofdm::tx::ofdm_modulate_scattered;
+
+        let target = Complex32::new(0.7, -0.4);
+        // Use high alpha for fast convergence from flat initial estimate.
+        // On a real signal, H converges from 1.0 to ~0.5 (half-energy from
+        // taking Re() of complex OFDM). After ~8 symbols the EMA stabilises.
+        let mut eq = ScatteredEqualizer::flat(0.5);
+
+        for sym_idx in 0..12 {
+            let n_data = num_data_at(sym_idx);
+            let data_sc = vec![target; n_data];
+            let sym = ofdm_modulate_scattered(&data_sc, sym_idx);
+
+            // Take real part only (matches TX WAV pipeline)
+            let sym_real: Vec<Complex32> = sym.iter()
+                .map(|s| Complex32::new(s.re, 0.0))
+                .collect();
+
+            let result = eq.process(&sym_real, sym_idx);
+            assert_eq!(result.data.len(), n_data,
+                "data len mismatch at sym {sym_idx}");
+
+            // After ~8 symbols the EMA has converged
+            if sym_idx >= 8 {
+                for (i, &d) in result.data.iter().enumerate() {
+                    let err = (d - target).norm();
+                    assert!(err < 0.1,
+                        "sym {sym_idx} data[{i}] = {d:?}, expected {target:?}, err={err:.4}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scattered_eq_snr_flat() {
+        use crate::ofdm::tx::ofdm_modulate_scattered;
+
+        let mut eq = ScatteredEqualizer::flat(0.3);
+        let mut last_snr = 0.0_f32;
+
+        for sym_idx in 0..10 {
+            let n_data = num_data_at(sym_idx);
+            let data_sc = vec![Complex32::new(1.0, 0.0); n_data];
+            let sym = ofdm_modulate_scattered(&data_sc, sym_idx);
+            let sym_real: Vec<Complex32> = sym.iter()
+                .map(|s| Complex32::new(s.re, 0.0))
+                .collect();
+            let result = eq.process(&sym_real, sym_idx);
+            last_snr = result.pilot_snr_db;
+        }
+        assert!(last_snr > 15.0,
+            "expected decent SNR on flat channel, got {last_snr:.1} dB");
+    }
+
+    // ── Legacy tests below ───────────────────────────────────────────────────
 
     #[test]
     fn flat_channel_data_recovery() {

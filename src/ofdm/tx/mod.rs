@@ -46,17 +46,43 @@ pub fn bits_to_symbol(bits: &[u8], modulation: Modulation) -> Complex32 {
 
 // ── OFDM data symbol ──────────────────────────────────────────────────────────
 
-/// Modulates [`NUM_DATA`] complex data subcarrier values into one OFDM symbol.
+/// Modulates data subcarrier values into one OFDM symbol with **scattered
+/// pilots** inserted at positions determined by `sym_idx` (DRM Mode B pattern).
 ///
-/// Pilots are inserted automatically at positions `k = 0, 8, 16, …, 64` using
-/// the PN sequence from [`crate::ofdm::params::pilot_sign`].
+/// `data_subcarriers` must have length `num_data_at(sym_idx)` (typically 35).
+/// `sym_idx` is the symbol's position in the transmission — pilots rotate
+/// with `sym_idx % SCAT_TIME_INT`.
 ///
 /// Returns [`SYMBOL_LEN`] time-domain samples (cyclic prefix prepended).
+pub fn ofdm_modulate_scattered(
+    data_subcarriers: &[Complex32],
+    sym_idx: usize,
+) -> Vec<Complex32> {
+    debug_assert_eq!(data_subcarriers.len(), num_data_at(sym_idx));
+
+    let mut freq = vec![Complex32::new(0.0, 0.0); FFT_SIZE];
+    let mut data_idx = 0usize;
+
+    for k in 0..NUM_CARRIERS {
+        let bin = carrier_to_bin(k);
+        if is_pilot_at(k, sym_idx) {
+            freq[bin] = pilot_value(k, sym_idx);
+        } else {
+            freq[bin] = data_subcarriers[data_idx];
+            data_idx += 1;
+        }
+    }
+
+    ifft_and_cp(freq)
+}
+
+/// Legacy modulator using fixed pilots at k=0,8,16,24,32,40 (pre-DRM).
+/// Kept for backward compatibility with old frame builder and tests.
+#[allow(dead_code)]
 pub fn ofdm_modulate(data_subcarriers: &[Complex32]) -> Vec<Complex32> {
     debug_assert_eq!(data_subcarriers.len(), NUM_DATA);
 
     let mut freq = vec![Complex32::new(0.0, 0.0); FFT_SIZE];
-
     let mut data_idx = 0usize;
     for k in 0..NUM_CARRIERS {
         let bin = carrier_to_bin(k);
