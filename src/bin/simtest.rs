@@ -19,20 +19,21 @@
 //!   --mod MOD        Modulation: bpsk qpsk 16qam 32qam 64qam  [default: bpsk]
 //!   --rs-level N     RS protection level: 0 1 2        [default: 1]
 //!   --payload-size N Payload bytes (≥1)               [default: 191]
-//!   --resync         Enable re-sync ZC symbols
 //! ```
 
+use num_complex::Complex32;
 use rand::{rngs::StdRng, SeedableRng};
 
 use rustpic::{
     fec::rs::RsLevel,
     ofdm::{
-        params::{CP_LEN, SYMBOL_LEN},
+        params::{MODE_HEADER_REPEAT, PREAMBLE_SYMS, RUNIN_PREAMBLE_SYMS, SYMBOL_LEN},
         rx::{
             frame::{FrameReceiver, PushResult, TransmissionReceiver, TxPushResult,
                     max_packets_per_frame},
-            mode_detect::{decode_mode_header, LdpcRate, Modulation},
-            sync::{correct_cfo, ZcCorrelator},
+            equalizer::ScatteredEqualizer,
+            mode_detect::{decode_mode_header_from_eq, LdpcRate, Modulation},
+            pilot_sync::scan_for_pilots,
         },
         tx::frame::{build_transmission, FrameConfig},
     },
@@ -145,12 +146,12 @@ fn print_help() {
 
 struct FrameEntry {
     ber:       f32,
-    ldpc_ok:   f32, // fraction of LDPC blocks converged
+    ldpc_ok:   f32,
     ldpc_fail: f32,
-    rs_ok:     f32, // fraction of RS packets decoded
+    rs_ok:     f32,
     rs_fail:   f32,
-    rs_margin: f32, // min RS budget remaining (fraction)
-    crc_ok:    f32, // 1.0 or 0.0
+    rs_margin: f32,
+    crc_ok:    f32,
 }
 
 // ── TX→channel→RX: full multi-super-frame transmission ───────────────────────
@@ -166,7 +167,6 @@ fn run_transmission(
     let total_pkt = payload.len().div_ceil(rs_k).max(1) as u16;
     let mut tx_rx = TransmissionReceiver::new(total_pkt, rs_k);
 
-    // Aggregate metrics across super-frames
     let mut sum_ber:           f32 = 0.0;
     let mut sum_ldpc_ok:       f32 = 0.0;
     let mut sum_ldpc_total:    u32 = 0;
@@ -176,56 +176,74 @@ fn run_transmission(
     let mut frames_processed:  usize = 0;
 
     for tx_frame in &tx_frames {
-        // Channel impairments (independent per super-frame: fresh guard + noise)
-        let mut rx_buf = channel.apply(tx_frame, rng);
+        let rx_buf = channel.apply(tx_frame, rng);
 
-        // Sync — limit search window to the preamble region only.
-        // Without this limit, find_sync searches the entire frame and can
-        // mistake a resync ZC (identical to the preamble) for ZC#1.
-        let sync_window_len = (channel.guard_samples_max + 3 * SYMBOL_LEN + 64)
-            .min(rx_buf.len());
-        let corr = ZcCorrelator::new(0.40, 0.30);
-        let sync  = match corr.find_sync(&rx_buf[..sync_window_len]) {
-            Ok(s) => s,
-            Err(_) => return None,
+        // ── Pilot-based sync ─────────────────────────────────────────────
+        let ps = match scan_for_pilots(&rx_buf, 0, 0.20, 0.55) {
+            Some(r) => r,
+            None => return None,
         };
-        correct_cfo(&mut rx_buf[sync.preamble_start..], sync.cfo_hz);
 
-        // Mode header
-        let hdr_start = sync.header_start;
-        if hdr_start + SYMBOL_LEN > rx_buf.len() { return None; }
-        let hdr_win = &rx_buf[hdr_start + CP_LEN..hdr_start + SYMBOL_LEN];
-        let header  = decode_mode_header(hdr_win, &sync.channel_est).ok()?;
+        let frame_start = ps.symbol_pos.saturating_sub(ps.sym_idx * SYMBOL_LEN);
 
-        // Frame receiver — with timing tracking at resync ZC positions
-        let mut rx         = FrameReceiver::new(&header, &sync.channel_est, 0.1);
-        let n_expected     = rx.expected_symbol_count();
-
-        // Zero-pad the buffer so the nominal positions (computed with rate_est=1.0)
-        // always fall within bounds.  Clock drift compresses the resampled buffer
-        // slightly; without padding the EOT position can be 1–15 samples past the
-        // end, which would force clamping and create a phase discontinuity versus
-        // the EMA-estimated channel.  A few zero samples beyond the EOT are harmless.
-        {
-            let nominal_end = sync.preamble_start + (3 + n_expected) * SYMBOL_LEN;
-            if rx_buf.len() < nominal_end {
-                rx_buf.resize(nominal_end, num_complex::Complex32::new(0.0, 0.0));
+        // ── CFO correction ───────────────────────────────────────────────
+        let mut buf = rx_buf;
+        if ps.cfo_hz.abs() > 0.1 {
+            let omega = -2.0 * std::f32::consts::PI * ps.cfo_hz
+                / rustpic::ofdm::params::SAMPLE_RATE;
+            for (i, s) in buf[frame_start..].iter_mut().enumerate() {
+                let phase = omega * i as f32;
+                *s *= Complex32::from_polar(1.0, phase);
             }
         }
-        let max_per        = max_packets_per_frame(header.modulation, header.ldpc_rate, header.rs_level);
-        let remaining      = header.total_packet_count
-                                .saturating_sub(header.packet_offset) as usize;
-        let pkts_this      = remaining.min(max_per);
 
-        // Simple symbol-by-symbol processing — no resync ZCs.
-        // Data symbols are at fixed positions after the mode header.
-        let data_start = hdr_start + SYMBOL_LEN;
+        // ── Equalizer warm-up on RUNIN preamble ──────────────────────────
+        let mut eq = ScatteredEqualizer::from_initial(&ps.channel_est, 0.3);
+        for i in 0..RUNIN_PREAMBLE_SYMS {
+            let off = frame_start + i * SYMBOL_LEN;
+            if off + SYMBOL_LEN <= buf.len() {
+                let _ = eq.process(&buf[off..off + SYMBOL_LEN], i);
+            }
+        }
+
+        // ── Mode header decode ───────────────────────────────────────────
+        let hdr_offset = frame_start + RUNIN_PREAMBLE_SYMS * SYMBOL_LEN;
+        let mut eq_vecs: Vec<Vec<Complex32>> = Vec::new();
+        for r in 0..MODE_HEADER_REPEAT {
+            let off = hdr_offset + r * SYMBOL_LEN;
+            if off + SYMBOL_LEN <= buf.len() {
+                let sym_idx = RUNIN_PREAMBLE_SYMS + r;
+                let res = eq.process(&buf[off..off + SYMBOL_LEN], sym_idx);
+                eq_vecs.push(res.data);
+            }
+        }
+        let eq_refs: Vec<&[Complex32]> = eq_vecs.iter().map(|v| v.as_slice()).collect();
+        let header = decode_mode_header_from_eq(&eq_refs).ok()?;
+
+        // ── Frame receiver ───────────────────────────────────────────────
+        let converged_h: Vec<Complex32> = (0..rustpic::ofdm::params::NUM_CARRIERS)
+            .map(|k| eq.h_at(k))
+            .collect();
+        let mut rx = FrameReceiver::new(&header, &converged_h, 0.3);
+        let n_expected = rx.expected_symbol_count();
+
+        // Zero-pad if needed
+        let data_start = frame_start + PREAMBLE_SYMS * SYMBOL_LEN;
+        let nominal_end = data_start + n_expected * SYMBOL_LEN;
+        if buf.len() < nominal_end {
+            buf.resize(nominal_end, Complex32::new(0.0, 0.0));
+        }
+
+        let max_per = max_packets_per_frame(header.modulation, header.ldpc_rate, header.rs_level);
+        let remaining = header.total_packet_count
+                            .saturating_sub(header.packet_offset) as usize;
+        let pkts_this = remaining.min(max_per);
+
         let mut frame_result = None;
-
         for i in 0..n_expected {
             let sym_pos = data_start + i * SYMBOL_LEN;
-            if sym_pos + SYMBOL_LEN > rx_buf.len() { return None; }
-            match rx.push_symbol(&rx_buf[sym_pos..sym_pos + SYMBOL_LEN]) {
+            if sym_pos + SYMBOL_LEN > buf.len() { return None; }
+            match rx.push_symbol(&buf[sym_pos..sym_pos + SYMBOL_LEN]) {
                 PushResult::NeedMore             => {}
                 PushResult::FrameComplete(frame) => { frame_result = Some(frame); break; }
                 PushResult::Error(_)             => return None,
@@ -233,14 +251,13 @@ fn run_transmission(
         }
 
         let frame = frame_result?;
-        let m     = &frame.metrics;
+        let m = &frame.metrics;
 
-        // Accumulate metrics
-        sum_ber       += m.channel_ber;
-        sum_ldpc_ok   += m.ldpc_converged as f32;
+        sum_ber        += m.channel_ber;
+        sum_ldpc_ok    += m.ldpc_converged as f32;
         sum_ldpc_total += m.ldpc_total;
-        sum_rs_ok     += frame.packets_ok as u32;
-        sum_rs_total  += pkts_this as u32;
+        sum_rs_ok      += frame.packets_ok as u32;
+        sum_rs_total   += pkts_this as u32;
         if m.rs_margin_frac < min_rs_margin { min_rs_margin = m.rs_margin_frac; }
         frames_processed += 1;
 
@@ -251,19 +268,15 @@ fn run_transmission(
                 m.rs_margin_frac, m.failing_block_indices);
         }
 
-
         let is_complete = matches!(tx_rx.push_frame(frame, &header), TxPushResult::Complete(_));
         if is_complete { break; }
     }
 
     if frames_processed == 0 { return None; }
 
-    // Retrieve the assembled result (if Complete was reached)
-    // For the stats we use the accumulated per-frame metrics.
     let n = frames_processed as f32;
     let ldpc_ok = if sum_ldpc_total > 0 { sum_ldpc_ok / sum_ldpc_total as f32 } else { 0.0 };
     let rs_ok   = if sum_rs_total   > 0 { sum_rs_ok as f32 / sum_rs_total as f32 } else { 0.0 };
-    // all_crc_ok() is tracked inside tx_rx; expose via a helper or read field
     let crc_ok  = tx_rx.is_all_crc_ok();
 
     Some(FrameEntry {
@@ -317,12 +330,10 @@ fn main() {
         rs_level:   cfg.rs_level,
     };
 
-    // Deterministic non-trivial payload (pseudo-random bytes)
     let payload: Vec<u8> = (0..cfg.payload_size)
         .map(|i| ((i.wrapping_mul(167).wrapping_add(13)) & 0xFF) as u8)
         .collect();
 
-    // ── Header ────────────────────────────────────────────────────────────────
     println!("RustPIC channel simulation");
     println!(
         "  modulation: {:?}  LDPC: {:?}  RS: L{}",
@@ -342,7 +353,6 @@ fn main() {
     println!("{hdr}");
     println!("{}", "-".repeat(hdr.len()));
 
-    // ── SNR sweep ─────────────────────────────────────────────────────────────
     let mut snr = cfg.snr_min;
     while snr <= cfg.snr_max + 1e-3 {
         let channel = SimChannel {
@@ -353,7 +363,6 @@ fn main() {
 
         let mut acc        = Acc::default();
         let mut sync_fails = 0usize;
-        // Seed from quantised SNR for reproducibility
         let mut rng = StdRng::seed_from_u64(0xC0DE_BEEFu64 ^ (snr * 100.0) as u64);
 
         for _ in 0..cfg.runs {

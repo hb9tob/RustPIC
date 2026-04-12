@@ -156,6 +156,35 @@ pub const RUNIN_PREAMBLE_SYMS: usize = 24;
 /// Flushes the RX Hilbert filter and keeps the equaliser stable.
 pub const RUNOUT_SYMS: usize = 4;
 
+/// FAC (Fast Access Channel) period in data symbols.
+///
+/// A QPSK symbol carrying the mode header is inserted every FAC_PERIOD data
+/// symbols (before data indices FAC_PERIOD, 2×FAC_PERIOD, …).  This enables
+/// late-entry sync: a receiver joining mid-transmission can decode the next
+/// FAC to learn modulation, LDPC rate, RS level, etc.
+///
+/// Set to the DRM frame period (15 symbols ≈ 400 ms) — the worst-case
+/// late-entry wait before finding a FAC.  Throughput overhead ≈ 6 %.
+pub const FAC_PERIOD: usize = 15;
+
+/// Number of FAC symbols inserted in a data pass of `data_syms` symbols.
+///
+/// FAC appears before data indices FAC_PERIOD, 2×FAC_PERIOD, etc.
+/// Used by both TX (to know how many extra symbols to emit) and RX (to
+/// predict total frame length).
+#[inline]
+pub fn fac_count_in_pass(data_syms: usize) -> usize {
+    if data_syms <= FAC_PERIOD { return 0; }
+    (data_syms - 1) / FAC_PERIOD
+}
+
+/// Returns `true` if a FAC symbol should be emitted before data symbol `i`
+/// within a pass.
+#[inline]
+pub fn is_fac_position(data_sym_index: usize) -> bool {
+    data_sym_index > 0 && data_sym_index % FAC_PERIOD == 0
+}
+
 /// Total non-data symbols before the first data symbol.
 /// RUNIN preamble + mode header repeats.
 pub const PREAMBLE_SYMS: usize = RUNIN_PREAMBLE_SYMS + MODE_HEADER_REPEAT;

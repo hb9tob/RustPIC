@@ -27,10 +27,10 @@ use crate::ofdm::{
     params::*,
     rx::{
         frame::{blocks_per_rs_group, crc32_ieee, max_packets_per_frame},
-        mode_detect::{encode_mode_header, LdpcRate, ModeHeader, Modulation},
+        mode_detect::{LdpcRate, ModeHeader, Modulation},
     },
     scrambler::G3ruhScrambler,
-    tx::{bits_to_symbol, ofdm_modulate, ofdm_modulate_all_carriers, ofdm_modulate_scattered},
+    tx::{bits_to_symbol, ofdm_modulate_scattered},
 };
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -185,44 +185,17 @@ fn build_frame_internal(
     all_coded_bits.resize(padded_len, 0);
     prbs.scramble_bits(&mut all_coded_bits);
 
-    // ── RUNIN: emit all data symbols TWICE ──────────────────────────────────
+    // ── RUNIN + DATA: emit all data symbols TWICE, with periodic FAC ───────
     // First pass  (RUNIN): trains the scattered-pilot equaliser on real data.
     // Second pass (DATA):  same LDPC blocks, now with a converged estimator.
     //
-    // The RX processes BOTH passes. Failed LDPC blocks from the RUNIN get a
-    // second chance on the DATA pass (soft-combine LLRs if both copies exist).
-    // QSSTV does 24 RUNIN + 10 RUNOUT segments; we do a full 1× repeat.
+    // FAC (Fast Access Channel) symbols are inserted every FAC_PERIOD data
+    // symbols so a late-joining RX can decode the mode without the preamble.
     //
     // sym_idx is CONTINUOUS across the whole frame so the scattered pilot
     // pattern rotates correctly.
-    // Layout: RUNIN_PREAMBLE(10) + mode_header(3) + pass1(D) + pass2(D) + EOT + RUNOUT(4)
     let preamble_syms = PREAMBLE_SYMS;
-
-    // Build OFDM symbols for one complete pass (bits → constellation → IFFT).
-    let build_pass = |sym_offset: usize| -> Vec<Vec<Complex32>> {
-        (0..total_data_syms)
-            .map(|i| {
-                let sym_idx = preamble_syms + sym_offset + i;
-                let n_data  = crate::ofdm::drm_pilots::drm_num_data(sym_idx);
-                let bits    = &all_coded_bits[i * bits_per_ofdm..(i + 1) * bits_per_ofdm];
-                // n_data may exceed NUM_DATA_PER_SYM by 1 for some sym phases;
-                // extra carriers get zero-padded.
-                let data_sc: Vec<Complex32> = (0..n_data)
-                    .map(|s| {
-                        let bit_start = s * bps;
-                        if bit_start + bps <= bits.len() {
-                            bits_to_symbol(&bits[bit_start..], config.modulation)
-                        } else {
-                            Complex32::new(0.0, 0.0) // padding
-                        }
-                    })
-                    .collect();
-                ofdm_modulate_scattered(&data_sc, sym_idx)
-            })
-            .collect()
-    };
-    let pass1_syms = build_pass(0);                     // RUNIN
-    let pass2_syms = build_pass(total_data_syms);       // DATA
+    let _facs_per_pass = fac_count_in_pass(total_data_syms);
 
     // ── 3. Assemble sample stream ────────────────────────────────────────────
     let mut samples: Vec<Complex32> = Vec::new();
@@ -230,8 +203,6 @@ fn build_frame_internal(
     // ── 3a. RUNIN preamble: pilot-bearing OFDM symbols before the mode
     // header.  These warm up the RX Hilbert filter on real OFDM signal
     // (not silence) and let the pilot sync detect the frame early.
-    // Like QSSTV's RUNIN segments, but using all-zero data carriers with
-    // proper scattered pilots so the RX equaliser can start tracking H.
     for i in 0..RUNIN_PREAMBLE_SYMS {
         let n_data = crate::ofdm::drm_pilots::drm_num_data(i);
         let dummy_data = vec![Complex32::new(0.0, 0.0); n_data];
@@ -248,18 +219,15 @@ fn build_frame_internal(
         crc_ok:             true,
     };
     let hdr_bits = crate::ofdm::rx::mode_detect::encode_mode_header_bits(&header);
-    // Emit MODE_HEADER_REPEAT copies of the mode-header as QPSK symbols with
-    // scattered pilots.  Each symbol carries 35 data carriers × 2 bits = 70 bits;
-    // the 42-bit header is placed in the first 21 QPSK symbols, rest is zero-padded.
-    for r in 0..MODE_HEADER_REPEAT {
-        let sym_idx = RUNIN_PREAMBLE_SYMS + r;
+
+    // Helper: build one QPSK FAC symbol at the given sym_idx.
+    let build_fac = |sym_idx: usize| -> Vec<Complex32> {
         let n_data = crate::ofdm::drm_pilots::drm_num_data(sym_idx);
         let data_sc: Vec<Complex32> = (0..n_data)
             .map(|s| {
                 let bit_idx = s * 2;
                 let b0 = hdr_bits.get(bit_idx).copied().unwrap_or(0);
                 let b1 = hdr_bits.get(bit_idx + 1).copied().unwrap_or(0);
-                // QPSK: (2b-1)/√2 for each component
                 let scale = std::f32::consts::FRAC_1_SQRT_2;
                 Complex32::new(
                     if b0 == 0 { scale } else { -scale },
@@ -267,19 +235,45 @@ fn build_frame_internal(
                 )
             })
             .collect();
-        samples.extend_from_slice(&ofdm_modulate_scattered(&data_sc, sym_idx));
+        ofdm_modulate_scattered(&data_sc, sym_idx)
+    };
+
+    // Emit MODE_HEADER_REPEAT copies of the mode-header as QPSK symbols with
+    // scattered pilots.
+    for r in 0..MODE_HEADER_REPEAT {
+        let sym_idx = RUNIN_PREAMBLE_SYMS + r;
+        samples.extend_from_slice(&build_fac(sym_idx));
     }
 
-    // ── 3b. RUNIN pass (first copy) ─────────────────────────────────────────
-    // Same data as the main pass — trains the equaliser on real pilots +
-    // gives the LDPC a first shot at each block.
-    for sym in &pass1_syms {
-        samples.extend_from_slice(sym);
-    }
+    // ── 3b+3c. Two passes: RUNIN (pass1) then DATA (pass2) ──────────────────
+    // Each pass emits total_data_syms data symbols with FAC insertions.
+    // `global_sym_idx` runs continuously across the whole frame.
+    let mut global_sym_idx = preamble_syms;
 
-    // ── 3c. DATA pass (second copy) ──────────────────────────────────────────
-    for sym in &pass2_syms {
-        samples.extend_from_slice(sym);
+    for _pass in 0..2 {
+        for i in 0..total_data_syms {
+            // Insert FAC before data symbols at multiples of FAC_PERIOD
+            if is_fac_position(i) {
+                samples.extend_from_slice(&build_fac(global_sym_idx));
+                global_sym_idx += 1;
+            }
+
+            // Data symbol
+            let n_data = crate::ofdm::drm_pilots::drm_num_data(global_sym_idx);
+            let bits = &all_coded_bits[i * bits_per_ofdm..(i + 1) * bits_per_ofdm];
+            let data_sc: Vec<Complex32> = (0..n_data)
+                .map(|s| {
+                    let bit_start = s * bps;
+                    if bit_start + bps <= bits.len() {
+                        bits_to_symbol(&bits[bit_start..], config.modulation)
+                    } else {
+                        Complex32::new(0.0, 0.0)
+                    }
+                })
+                .collect();
+            samples.extend_from_slice(&ofdm_modulate_scattered(&data_sc, global_sym_idx));
+            global_sym_idx += 1;
+        }
     }
 
     // EOT: CRC32 over groups×M×rs_k bytes — same layout the RX assembles
@@ -291,9 +285,9 @@ fn build_frame_internal(
         padded[..copy_len].copy_from_slice(&payload[..copy_len]);
         crc32_ieee(&padded)
     };
-    let eot_sym_idx = preamble_syms + 2 * total_data_syms;
+    let eot_sym_idx = global_sym_idx;
     let n_eot_data = crate::ofdm::drm_pilots::drm_num_data(eot_sym_idx);
-    let crc_bits = n_eot_data.min(32); // transmit as many CRC bits as we have carriers
+    let crc_bits = n_eot_data.min(32);
     let eot_sc: Vec<Complex32> = (0..n_eot_data)
         .map(|i| {
             if i < crc_bits {
@@ -305,12 +299,11 @@ fn build_frame_internal(
         })
         .collect();
     samples.extend_from_slice(&ofdm_modulate_scattered(&eot_sc, eot_sym_idx));
+    global_sym_idx += 1;
 
     // ── RUNOUT: pilot-bearing dummy symbols after the EOT ─────────────────
-    // Ensures the RX Hilbert filter and equaliser have valid pilot data
-    // all the way through the last decoded symbol (like QSSTV's RUNOUT).
     for i in 0..RUNOUT_SYMS {
-        let idx = eot_sym_idx + 1 + i;
+        let idx = global_sym_idx + i;
         let n_data = crate::ofdm::drm_pilots::drm_num_data(idx);
         let dummy = vec![Complex32::new(0.0, 0.0); n_data];
         samples.extend_from_slice(&ofdm_modulate_scattered(&dummy, idx));

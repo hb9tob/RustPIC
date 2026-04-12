@@ -85,7 +85,7 @@ pub const MAX_DATA_SYMS_PER_FRAME: usize = 1_400;
 /// of `rs_n` bytes each.
 ///
 /// The last block may be partially padded.
-pub(crate) fn blocks_per_rs_group(ldpc_k: usize, rs_n: usize, m: usize) -> usize {
+pub fn blocks_per_rs_group(ldpc_k: usize, rs_n: usize, m: usize) -> usize {
     (m * rs_n * 8).div_ceil(ldpc_k)
 }
 
@@ -242,8 +242,12 @@ pub struct FrameReceiver {
 
     // ── Symbol / block counters ────────────────────────────────────────────────
     warmup_remaining:    usize,
-    total_syms_fed:      usize, // warmup + data, for sym_idx pilot pattern
-    data_syms_received:  usize,
+    total_syms_fed:      usize, // warmup + data + FAC, for sym_idx pilot pattern
+    data_syms_received:  usize, // total data syms across both passes
+    data_idx_in_pass:    usize, // data sym index within current pass (resets at pass boundary)
+    data_since_last_fac: usize, // counts 0..FAC_PERIOD, triggers FAC at FAC_PERIOD
+    facs_per_pass:       usize, // number of FAC symbols per pass
+    facs_emitted:        usize, // total FAC symbols consumed so far
     syms_in_group:       usize,
     ldpc_blocks_decoded: usize,
     rs_packets_ok:       u16,
@@ -289,6 +293,8 @@ impl FrameReceiver {
         // TX sends 2 passes (RUNIN + DATA), so total data symbols = 2×.
         let total_data_syms   = 2 * data_syms_per_pass;
 
+        let facs_per_pass = fac_count_in_pass(data_syms_per_pass);
+
         Self {
             header:             header.clone(),
             ldpc_k,
@@ -312,6 +318,10 @@ impl FrameReceiver {
             warmup_remaining:    0,  // match TX WARMUP_SYMS
             total_syms_fed:      0,
             data_syms_received:  0,
+            data_idx_in_pass:    0,
+            data_since_last_fac: 0,
+            facs_per_pass,
+            facs_emitted:        0,
             syms_in_group:       0,
             ldpc_blocks_decoded: 0,
             rs_packets_ok:       0,
@@ -344,9 +354,9 @@ impl FrameReceiver {
     /// Total number of OFDM symbols this receiver expects before returning
     /// [`PushResult::FrameComplete`].
     ///
-    /// Includes data symbols and the EOT symbol.
+    /// Includes data symbols, FAC symbols (both passes), and the EOT symbol.
     pub fn expected_symbol_count(&self) -> usize {
-        self.total_data_syms + 1 // data + EOT
+        self.total_data_syms + 2 * self.facs_per_pass + 1 // data + FACs + EOT
     }
 
     // ── Main entry point ──────────────────────────────────────────────────────
@@ -355,6 +365,10 @@ impl FrameReceiver {
     ///
     /// Returns [`PushResult::NeedMore`] until the last symbol (EOT) is received,
     /// at which point [`PushResult::FrameComplete`] is returned.
+    ///
+    /// FAC (Fast Access Channel) symbols are automatically detected at their
+    /// expected positions and processed for channel tracking only — their
+    /// LLRs are not fed into the LDPC decoder.
     pub fn push_symbol(&mut self, ofdm_symbol: &[Complex32]) -> PushResult {
         debug_assert_eq!(ofdm_symbol.len(), SYMBOL_LEN);
 
@@ -364,22 +378,30 @@ impl FrameReceiver {
         }
 
         // ── Warm-up symbols: EQ training only, no LDPC ────────────────────────
-        // The TX prepends WARMUP_SYMS copies of the first data symbols so the
-        // scattered-pilot equaliser converges before real data begins.
-        // We process them for channel tracking but discard their LLRs.
         if self.warmup_remaining > 0 {
-            let warmup_idx = 10 - self.warmup_remaining; // 0, 1, 2, ...
+            let warmup_idx = 10 - self.warmup_remaining;
             let sym_idx = PREAMBLE_SYMS + warmup_idx;
             let _eq = self.equalizer.process(ofdm_symbol, sym_idx);
             self.warmup_remaining -= 1;
             return PushResult::NeedMore;
         }
 
+        // ── FAC symbol? ──────────────────────────────────────────────────────
+        // A FAC is expected after every FAC_PERIOD data symbols in each pass.
+        // Process for channel tracking only — don't feed LLRs.
+        if self.data_since_last_fac >= FAC_PERIOD {
+            let sym_idx = PREAMBLE_SYMS + self.data_syms_received + self.facs_emitted;
+            let _eq = self.equalizer.process(ofdm_symbol, sym_idx);
+            self.total_syms_fed += 1;
+            self.facs_emitted   += 1;
+            self.data_since_last_fac = 0;
+            return PushResult::NeedMore;
+        }
+
         // ── Regular data symbol ───────────────────────────────────────────────
-        // sym_idx = MODE_HEADER_REPEAT + data_syms_received, matching the TX's
-        // ofdm_modulate_scattered(data, MODE_HEADER_REPEAT + i).
-        let sym_idx = PREAMBLE_SYMS + self.data_syms_received;
+        let sym_idx = PREAMBLE_SYMS + self.data_syms_received + self.facs_emitted;
         let eq = self.equalizer.process(ofdm_symbol, sym_idx);
+
         // Only accumulate SNR metrics from pass2 (converged equaliser).
         let in_pass2 = self.data_syms_received >= self.data_syms_per_pass;
         if in_pass2 {
@@ -401,23 +423,24 @@ impl FrameReceiver {
         }
 
         let mut llrs = demap(&eq.data, &eq.noise_var, self.header.modulation);
-        // Truncate to bits_per_ofdm: some symbols have 1 extra data carrier
-        // due to the scattered pilot pattern (e.g. 29 vs 28 data carriers).
         let bits_per_ofdm = NUM_DATA_PER_SYM * self.header.modulation.bits_per_symbol();
         llrs.truncate(bits_per_ofdm);
-        self.data_syms_received += 1;
-        self.total_syms_fed     += 1;
-        self.syms_in_group      += 1;
+
+        self.data_syms_received  += 1;
+        self.data_idx_in_pass    += 1;
+        self.data_since_last_fac += 1;
+        self.total_syms_fed      += 1;
+        self.syms_in_group       += 1;
 
         // Pass 1 (RUNIN): EQ training only — don't accumulate LLR or drain.
-        // The equaliser converges on the real scattered pilots. All decode
-        // happens in pass2 when the estimator is stable.
         if self.data_syms_received <= self.data_syms_per_pass {
             if self.data_syms_received == self.data_syms_per_pass {
                 // Boundary: reset for pass2.
-                self.syms_in_group = 0;
-                self.pilot_snr_sum = 0.0;
-                self.pilot_snr_count = 0;
+                self.data_idx_in_pass    = 0;
+                self.data_since_last_fac = 0;
+                self.syms_in_group       = 0;
+                self.pilot_snr_sum       = 0.0;
+                self.pilot_snr_count     = 0;
             }
             return PushResult::NeedMore;
         }
@@ -428,6 +451,7 @@ impl FrameReceiver {
 
         PushResult::NeedMore
     }
+
 
     // ── LDPC block draining ───────────────────────────────────────────────────
 
@@ -589,7 +613,7 @@ impl FrameReceiver {
         }
 
         // Equalize the EOT symbol — use ALL data carriers (don't truncate)
-        let eot_sym_idx = PREAMBLE_SYMS + self.data_syms_received;
+        let eot_sym_idx = PREAMBLE_SYMS + self.data_syms_received + self.facs_emitted;
         let eq      = self.equalizer.process(ofdm_symbol, eot_sym_idx);
         let eot_llr = demap(&eq.data, &eq.noise_var, Modulation::Bpsk);
         // Note: eot_llr may have 28 or 29 elements depending on pilot phase.
@@ -872,8 +896,9 @@ mod tests {
         let h_est = flat_channel_est();
         let rx = FrameReceiver::new(&header, &h_est, 0.1);
         // total_data_syms = 2 × data_per_pass (RUNIN + DATA)
+        let fpp = fac_count_in_pass(expected_data);
         assert_eq!(rx.total_data_syms, 2 * expected_data);
-        assert_eq!(rx.expected_symbol_count(), 2 * expected_data + 1);
+        assert_eq!(rx.expected_symbol_count(), 2 * expected_data + 2 * fpp + 1);
     }
 
     #[test]
@@ -930,26 +955,46 @@ mod tests {
             crate::ofdm::tx::ofdm_modulate_scattered(&data_sc, sym_idx)
         };
 
+        // Build a dummy FAC symbol (all-zero QPSK) at a given sym_idx.
+        let build_fac = |sym_idx: usize| -> Vec<Complex32> {
+            let n_data = crate::ofdm::drm_pilots::drm_num_data(sym_idx);
+            let data_sc = vec![Complex32::new(0.707, 0.707); n_data];
+            crate::ofdm::tx::ofdm_modulate_scattered(&data_sc, sym_idx)
+        };
+
+        let facs_per_pass = fac_count_in_pass(data_syms_per_pass);
         let mut ofdm_syms: Vec<Vec<Complex32>> = Vec::new();
-        // Pass 1 (RUNIN)
+        let mut global_sym_idx = preamble_syms;
+
+        // Pass 1 (RUNIN) — with FAC insertions
         for i in 0..data_syms_per_pass {
+            if is_fac_position(i) {
+                ofdm_syms.push(build_fac(global_sym_idx));
+                global_sym_idx += 1;
+            }
             let start = i * bits_per_ofdm;
             let end   = (start + bits_per_ofdm).min(all_coded_bits.len());
-            ofdm_syms.push(bits_to_scattered(&all_coded_bits[start..end], preamble_syms + i));
+            ofdm_syms.push(bits_to_scattered(&all_coded_bits[start..end], global_sym_idx));
+            global_sym_idx += 1;
         }
-        // Pass 2 (DATA) — identical bits, different sym_idx
+        // Pass 2 (DATA) — identical bits, different sym_idx, with FAC
         for i in 0..data_syms_per_pass {
+            if is_fac_position(i) {
+                ofdm_syms.push(build_fac(global_sym_idx));
+                global_sym_idx += 1;
+            }
             let start = i * bits_per_ofdm;
             let end   = (start + bits_per_ofdm).min(all_coded_bits.len());
-            ofdm_syms.push(bits_to_scattered(&all_coded_bits[start..end], preamble_syms + data_syms_per_pass + i));
+            ofdm_syms.push(bits_to_scattered(&all_coded_bits[start..end], global_sym_idx));
+            global_sym_idx += 1;
         }
 
         // EOT CRC32
         let rs_payload_bytes = m * rs_k;
         let crc = crc32_ieee(&vec![0u8; rs_payload_bytes]);
-        let eot_sym_idx = preamble_syms + 2 * data_syms_per_pass;
+        let eot_sym_idx = global_sym_idx;
         let n_eot_data = crate::ofdm::drm_pilots::drm_num_data(eot_sym_idx);
-        let mut eot_data: Vec<Complex32> = (0..n_eot_data)
+        let eot_data: Vec<Complex32> = (0..n_eot_data)
             .map(|i| {
                 if i < 32 {
                     let bit = ((crc >> (31 - i)) & 1) as u8;
@@ -974,8 +1019,11 @@ mod tests {
         let h_est = flat_channel_est();
         let mut rx = FrameReceiver::new(&header, &h_est, 0.1);
 
-        assert_eq!(rx.total_data_syms, 2 * data_syms_per_pass,
+        assert_eq!(rx.total_data_syms(), 2 * data_syms_per_pass,
             "FrameReceiver and test disagree on data symbol count");
+        assert_eq!(rx.expected_symbol_count(),
+            2 * data_syms_per_pass + 2 * facs_per_pass + 1,
+            "expected_symbol_count must include FACs and EOT");
 
         let mut result = None;
         for sym in &ofdm_syms {

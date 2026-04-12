@@ -295,12 +295,102 @@ fn main() {
                 if std::env::var("SYNC_DEBUG").is_ok() {
                     eprintln!("  [hdr] FAIL at frame_start={}: {e}", frame_start);
                 }
-                known_frame_start = None;
-                // Advance well past the detected position to avoid re-detecting
-                // the same symbol.  Jump by SYMBOLS_PER_FRAME to try the next
-                // possible frame alignment.
-                search_start = frame_start + SYMBOLS_PER_FRAME * SYMBOL_LEN;
-                continue;
+                // ── FAC late entry: scan forward for a FAC symbol ────────
+                // The mode header is missing (late join / truncated audio).
+                // Scan forward one symbol at a time, decode each as QPSK FAC,
+                // and check CRC-16.
+                let fac_search_start = frame_start + PREAMBLE_SYMS * SYMBOL_LEN;
+                let mut fac_header: Option<ModeHeader> = None;
+                let mut fac_pos: usize = 0;
+                let max_fac_search = 2 * rustpic::ofdm::rx::frame::MAX_DATA_SYMS_PER_FRAME;
+
+                // Use the equalizer we already warmed up (or build a fresh one).
+                let mut fac_eq = ScatteredEqualizer::from_initial(&channel_est, 0.3);
+                // Warm up on a few symbols from the detected pilot position
+                let warmup_start = frame_start;
+                let warmup_count = ((fac_search_start - warmup_start) / SYMBOL_LEN).min(30);
+                for i in 0..warmup_count {
+                    let off = warmup_start + i * SYMBOL_LEN;
+                    if off + SYMBOL_LEN <= audio.len() {
+                        let _ = fac_eq.process(&audio[off..off + SYMBOL_LEN], i);
+                    }
+                }
+
+                let mut sym_idx_counter = warmup_count;
+                for scan in 0..max_fac_search {
+                    let pos = fac_search_start + scan * SYMBOL_LEN;
+                    if pos + SYMBOL_LEN > audio.len() { break; }
+                    let res = fac_eq.process(&audio[pos..pos + SYMBOL_LEN], sym_idx_counter);
+                    sym_idx_counter += 1;
+
+                    // Try to decode this symbol as a QPSK FAC
+                    if let Ok(h) = decode_mode_header_from_eq(&[res.data.as_slice()]) {
+                        if std::env::var("SYNC_DEBUG").is_ok() {
+                            eprintln!("  [fac] FOUND at {:.3}s (scan={}): {}",
+                                pos as f64 / SAMPLE_RATE as f64, scan, h);
+                        }
+                        fac_header = Some(h);
+                        fac_pos = pos;
+                        break;
+                    }
+                }
+
+                match fac_header {
+                    Some(h) => {
+                        // FAC found mid-stream — we know the mode.  Compute
+                        // frame geometry to estimate where the data region ends.
+                        let data_per_pass = {
+                            let code = rustpic::fec::ldpc::LdpcCode::for_rate(h.ldpc_rate);
+                            let bps = h.modulation.bits_per_symbol();
+                            let (rs_n, _, rs_2t) = h.rs_level.params();
+                            let m = rustpic::fec::rs::rs_interleave_m(rs_2t, code.k);
+                            let bpg = rustpic::ofdm::rx::frame::blocks_per_rs_group(code.k, rs_n, m);
+                            let remaining = h.total_packet_count.saturating_sub(h.packet_offset) as usize;
+                            let pkts = remaining.min(max_packets_per_frame(h.modulation, h.ldpc_rate, h.rs_level));
+                            let groups = pkts.div_ceil(m);
+                            let total_bits = groups * bpg * 1944;
+                            let bits_per_sym = rustpic::ofdm::params::NUM_DATA_PER_SYM * bps;
+                            total_bits.div_ceil(bits_per_sym)
+                        };
+                        let facs_pp = rustpic::ofdm::params::fac_count_in_pass(data_per_pass);
+                        let pass_syms = data_per_pass + facs_pp;
+                        // Jump forward past the remaining data of this frame.
+                        // We're at fac_pos; the worst case is that the FAC was
+                        // the first one in pass1, so up to 2×pass_syms remain.
+                        let skip = fac_pos + 2 * pass_syms * SYMBOL_LEN;
+
+                        if std::env::var("SYNC_DEBUG").is_ok() {
+                            eprintln!("  [fac] data_per_pass={} facs_pp={} fac_at={:.3}s skip_to={:.3}s",
+                                data_per_pass, facs_pp,
+                                fac_pos as f64 / SAMPLE_RATE as f64,
+                                skip as f64 / SAMPLE_RATE as f64);
+                        }
+
+                        // Set up assembler with known mode
+                        if tx_rx.is_none() {
+                            let (_, rs_k, _) = h.rs_level.params();
+                            tx_rx = Some(TransmissionReceiver::new(h.total_packet_count, rs_k));
+                        }
+
+                        eprintln!("  [late] skipping partial frame (FAC: {} {}), \
+                                   scanning from {:.1}s",
+                            h.modulation, h.ldpc_rate,
+                            skip as f64 / SAMPLE_RATE as f64);
+
+                        // Let pilot sync find the next frame naturally
+                        known_frame_start = None;
+                        search_start = skip;
+                        continue;
+                    }
+                    None => {
+                        if std::env::var("SYNC_DEBUG").is_ok() {
+                            eprintln!("  [fac] no FAC found after scanning {} symbols", max_fac_search);
+                        }
+                        known_frame_start = None;
+                        search_start = frame_start + SYMBOLS_PER_FRAME * SYMBOL_LEN;
+                        continue;
+                    }
+                }
             }
         };
 

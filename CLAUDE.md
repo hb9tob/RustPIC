@@ -62,7 +62,13 @@ correction budget.
 
 ### Super-frame layout
 
-`ZC#1 | ZC#2 | mode header (BPSK+CRC16, 32-bit diversity) | data×N [| resync ZC | data×…] | EOT (CRC-32 in first 32 data carriers)`
+`RUNIN(24) | mode header (QPSK×3) | [data×14 | FAC]* | data×tail | EOT (CRC-32)`
+
+The frame has two data passes: RUNIN (equaliser training, LLRs discarded) and DATA
+(decoded for real). Each pass has periodic **FAC (Fast Access Channel)** symbols every
+`FAC_PERIOD=15` data symbols — QPSK symbols carrying the same mode header bits, enabling
+**late-entry sync**: a receiver joining mid-transmission decodes the next FAC to learn
+modulation, LDPC rate, RS level, etc. without needing the preamble.
 
 The mode header encodes modulation, LDPC rate, RS level, and a 12-bit `packet_offset` so
 large payloads split across multiple super-frames reassemble in order.
