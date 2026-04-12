@@ -1,4 +1,5 @@
 pub mod sync;
+pub mod pilot_sync;
 pub mod mode_detect;
 pub mod equalizer;
 pub mod demapper;
