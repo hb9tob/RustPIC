@@ -588,23 +588,29 @@ impl FrameReceiver {
             self.drain_ldpc_blocks();
         }
 
-        // Equalize the EOT symbol with BPSK demapper
+        // Equalize the EOT symbol — use ALL data carriers (don't truncate)
         let eot_sym_idx = PREAMBLE_SYMS + self.data_syms_received;
         let eq      = self.equalizer.process(ofdm_symbol, eot_sym_idx);
         let eot_llr = demap(&eq.data, &eq.noise_var, Modulation::Bpsk);
+        // Note: eot_llr may have 28 or 29 elements depending on pilot phase.
 
-        // Hard-decision on the first 32 subcarriers → 32-bit CRC
+        // Hard-decision on available data carriers → compare CRC bits.
+        // With 34 carriers we get 28-29 data carriers per symbol, so we
+        // compare the top 28-29 bits of the CRC32 (MSB first).
+        let crc_bits = eot_llr.len().min(32);
         let received_crc = {
             let mut acc = 0u32;
-            for (i, &llr) in eot_llr.iter().take(32).enumerate() {
-                let bit = u32::from(llr < 0.0); // LLR < 0 → bit 1
+            for (i, &llr) in eot_llr.iter().take(crc_bits).enumerate() {
+                let bit = u32::from(llr < 0.0);
                 acc |= bit << (31 - i);
             }
             acc
         };
 
         let computed_crc = crc32_ieee(&self.rs_payload);
-        let crc32_ok = received_crc == computed_crc;
+        // Mask to compare only the transmitted bits
+        let mask = if crc_bits < 32 { !((1u32 << (32 - crc_bits)) - 1) } else { u32::MAX };
+        let crc32_ok = (received_crc & mask) == (computed_crc & mask);
 
         let pilot_snr_db = if self.pilot_snr_count > 0 {
             self.pilot_snr_sum / self.pilot_snr_count as f32

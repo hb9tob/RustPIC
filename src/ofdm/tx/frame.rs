@@ -293,9 +293,10 @@ fn build_frame_internal(
     };
     let eot_sym_idx = preamble_syms + 2 * total_data_syms;
     let n_eot_data = crate::ofdm::drm_pilots::drm_num_data(eot_sym_idx);
+    let crc_bits = n_eot_data.min(32); // transmit as many CRC bits as we have carriers
     let eot_sc: Vec<Complex32> = (0..n_eot_data)
         .map(|i| {
-            if i < 32 {
+            if i < crc_bits {
                 let bit = (crc >> (31 - i)) & 1;
                 Complex32::new(if bit == 0 { 1.0 } else { -1.0 }, 0.0)
             } else {
