@@ -1,6 +1,6 @@
 [package]
 name        = "rustpic"
-version     = "0.13.0"
+version     = "0.14.0"
 edition     = "2021"
 description = "RustPIC — digital image transmission over narrow-band FM via voice repeaters"
 license     = "MIT"

@@ -99,6 +99,50 @@ fn main() {
         die(&format!("unsupported sample rate {wav_rate} Hz (expected 48000)"));
     }
 
+    // ── AGC: block-wise RMS normalisation ──────────────────────────────────────
+    // Normalise the audio to a target RMS of 0.2 (matching the TX's OFDM level)
+    // using overlapping blocks of ~100 ms (4800 samples at 48 kHz).  This
+    // removes the receiver's volume-setting dependence: whether the soundcard
+    // is at 20 % or 80 %, the correlator and equaliser see the same amplitude.
+    //
+    // The gain is applied per-sample with linear interpolation between block
+    // boundaries to avoid discontinuities.  A minimum RMS floor prevents
+    // noise-only silence from being amplified to infinity.
+    let wav_samples = {
+        const AGC_BLOCK: usize = 4800;       // ~100 ms at 48 kHz
+        const TARGET_RMS: f32  = 0.20;
+        const MIN_RMS: f32     = 1e-4;       // don't amplify pure silence
+
+        let n = wav_samples.len();
+        if n < AGC_BLOCK {
+            wav_samples
+        } else {
+            // Compute per-block RMS and the resulting gain.
+            let n_blocks = n.div_ceil(AGC_BLOCK);
+            let mut gains = Vec::with_capacity(n_blocks);
+            for b in 0..n_blocks {
+                let start = b * AGC_BLOCK;
+                let end   = (start + AGC_BLOCK).min(n);
+                let rms   = (wav_samples[start..end].iter()
+                    .map(|&x| x * x).sum::<f32>() / (end - start) as f32)
+                    .sqrt();
+                gains.push(if rms > MIN_RMS { TARGET_RMS / rms } else { 1.0 });
+            }
+
+            // Apply gain with linear interpolation between block centres.
+            let mut out = wav_samples;
+            for i in 0..n {
+                let block_f  = i as f32 / AGC_BLOCK as f32 - 0.5;
+                let b0       = (block_f.floor() as i32).clamp(0, n_blocks as i32 - 1) as usize;
+                let b1       = (b0 + 1).min(n_blocks - 1);
+                let t        = (block_f - b0 as f32).clamp(0.0, 1.0);
+                let gain     = gains[b0] * (1.0 - t) + gains[b1] * t;
+                out[i] *= gain;
+            }
+            out
+        }
+    };
+
     // ── Convert to Complex32 (imaginary = 0) ──────────────────────────────────
     let audio: Vec<Complex32> = wav_samples.iter()
         .map(|&x| Complex32::new(x, 0.0))
