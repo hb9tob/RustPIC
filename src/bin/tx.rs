@@ -62,7 +62,7 @@ impl Default for Cfg {
             papr_clip:  Some(12.0),  // default on — soft tanh clip at RMS+12 dB
             gain_db:    0.0,
             deemph_tau: None,
-            bandpass:   false,
+            bandpass:   true,  // confine energy to 300-2600 Hz, reduces OOB leakage
             smooth_tw:  0,
         }
     }
@@ -322,9 +322,13 @@ fn main() {
         samples_f
     };
 
-    // Normalize so peak hits 90 % of i16 full-scale.
-    let peak = samples_f.iter().map(|&x| x.abs()).fold(0f32, f32::max);
-    let mut scale = if peak > 1e-9 { 0.9 * 32767.0 / peak } else { 32767.0 };
+    // Normalize by average power (QSSTV-style: 6000/√avg_power).
+    // This gives a consistent RMS level regardless of PAPR, instead of
+    // wasting dynamic range on occasional peaks.  Then clamp to ±1.0
+    // to prevent i16 overflow.
+    let rms = (samples_f.iter().map(|&x| x * x).sum::<f32>() / samples_f.len() as f32).sqrt();
+    let target_rms = 0.15; // ~15% of full scale → leaves ~16 dB headroom for peaks
+    let mut scale = if rms > 1e-9 { target_rms * 32767.0 / rms } else { 32767.0 };
 
     // Optional additional gain.
     if cfg.gain_db != 0.0 {
