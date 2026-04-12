@@ -344,14 +344,9 @@ impl FrameReceiver {
     /// Total number of OFDM symbols this receiver expects before returning
     /// [`PushResult::FrameComplete`].
     ///
-    /// Includes data symbols, optional re-sync ZC symbols, and the EOT symbol.
+    /// Includes data symbols and the EOT symbol.
     pub fn expected_symbol_count(&self) -> usize {
-        let resync_syms = if self.header.has_resync {
-            self.total_data_syms / RESYNC_PERIOD
-        } else {
-            0
-        };
-        self.total_data_syms + resync_syms + 1 // data + resync + EOT (warmup handled separately when > 0)
+        self.total_data_syms + 1 // data + EOT
     }
 
     // ── Main entry point ──────────────────────────────────────────────────────
@@ -368,34 +363,22 @@ impl FrameReceiver {
             return self.process_eot(ofdm_symbol);
         }
 
-        // ── Re-sync ZC guard ─────────────────────────────────────────────────
-        if self.header.has_resync && self.syms_in_group == RESYNC_PERIOD {
-            // Re-seed the equalizer from the resync ZC's channel estimate.
-            let fft_window = &ofdm_symbol[CP_LEN..];
-            let h_new = crate::ofdm::rx::sync::channel_estimate_from_zc(fft_window);
-            self.equalizer.resync(&h_new);
-            self.syms_in_group = 0;
-            return PushResult::NeedMore;
-        }
-
         // ── Warm-up symbols: EQ training only, no LDPC ────────────────────────
         // The TX prepends WARMUP_SYMS copies of the first data symbols so the
         // scattered-pilot equaliser converges before real data begins.
         // We process them for channel tracking but discard their LLRs.
         if self.warmup_remaining > 0 {
-            // Warmup symbols are copies of the first data symbols — their
-            // sym_idx matches the data symbols they mirror.
             let warmup_idx = 10 - self.warmup_remaining; // 0, 1, 2, ...
-            let sym_idx = (2 + MODE_HEADER_REPEAT) + warmup_idx;
+            let sym_idx = MODE_HEADER_REPEAT + warmup_idx;
             let _eq = self.equalizer.process(ofdm_symbol, sym_idx);
             self.warmup_remaining -= 1;
             return PushResult::NeedMore;
         }
 
         // ── Regular data symbol ───────────────────────────────────────────────
-        // sym_idx = preamble_syms + data_syms_received, matching the TX's
-        // ofdm_modulate_scattered(data, preamble_syms + i).
-        let sym_idx = (2 + MODE_HEADER_REPEAT) + self.data_syms_received;
+        // sym_idx = MODE_HEADER_REPEAT + data_syms_received, matching the TX's
+        // ofdm_modulate_scattered(data, MODE_HEADER_REPEAT + i).
+        let sym_idx = MODE_HEADER_REPEAT + self.data_syms_received;
         let eq = self.equalizer.process(ofdm_symbol, sym_idx);
         // Only accumulate SNR metrics from pass2 (converged equaliser).
         let in_pass2 = self.data_syms_received >= self.data_syms_per_pass;
@@ -602,7 +585,7 @@ impl FrameReceiver {
         }
 
         // Equalize the EOT symbol with BPSK demapper
-        let eot_sym_idx = (2 + MODE_HEADER_REPEAT) + self.data_syms_received;
+        let eot_sym_idx = MODE_HEADER_REPEAT + self.data_syms_received;
         let eq      = self.equalizer.process(ofdm_symbol, eot_sym_idx);
         let eot_llr = demap(&eq.data, &eq.noise_var, Modulation::Bpsk);
 
@@ -858,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn expected_symbol_count_no_resync() {
+    fn expected_symbol_count() {
         let header = ModeHeader {
             modulation:         Modulation::Qam16,
             ldpc_rate:          LdpcRate::R3_4,
@@ -872,32 +855,15 @@ mod tests {
         let (rs_n, _, rs_2t) = header.rs_level.params();
         let m   = rs_interleave_m(rs_2t, code.k);
         let bpg = blocks_per_rs_group(code.k, rs_n, m);
-        // 1 RS packet → ceil(1/M)=1 group → bpg blocks → OFDM symbols
         let groups = 1usize.div_ceil(m);
         let total_coded   = groups * bpg * LDPC_N;
         let bits_per_ofdm = NUM_DATA * 4;
         let expected_data = total_coded.div_ceil(bits_per_ofdm);
         let h_est = flat_channel_est();
         let rx = FrameReceiver::new(&header, &h_est, 0.1);
-        assert_eq!(rx.total_data_syms, expected_data);
-        assert_eq!(rx.expected_symbol_count(), expected_data + 1);
-    }
-
-    #[test]
-    fn expected_symbol_count_with_resync() {
-        let header = ModeHeader {
-            modulation:         Modulation::Bpsk,
-            ldpc_rate:          LdpcRate::R1_2,
-            rs_level:           RsLevel::L1,
-            has_resync:         true,
-            total_packet_count: 1,
-            packet_offset:      0,
-            crc_ok:             true,
-        };
-        let h_est = flat_channel_est();
-        let rx    = FrameReceiver::new(&header, &h_est, 0.1);
-        let resync_syms = rx.total_data_syms / RESYNC_PERIOD;
-        assert_eq!(rx.expected_symbol_count(), rx.total_data_syms + resync_syms + 1);
+        // total_data_syms = 2 × data_per_pass (RUNIN + DATA)
+        assert_eq!(rx.total_data_syms, 2 * expected_data);
+        assert_eq!(rx.expected_symbol_count(), 2 * expected_data + 1);
     }
 
     #[test]
@@ -934,31 +900,56 @@ mod tests {
         // → all-zero LDPC codewords (zero satisfies every parity check).
         let total_coded_bits = bpg * LDPC_N; // 5 × 1944 = 9720
 
-        // ── Build OFDM symbols ────────────────────────────────────────────────
-        let bits_per_ofdm = NUM_DATA * bps; // 63
-        let total_data_syms = total_coded_bits.div_ceil(bits_per_ofdm); // 155
+        // ── Build OFDM symbols (2 passes: RUNIN + DATA) ─────────────────────
+        let bits_per_ofdm = NUM_DATA * bps; // 35
+        let data_syms_per_pass = total_coded_bits.div_ceil(bits_per_ofdm);
+        let preamble_syms = MODE_HEADER_REPEAT;
 
-        // Scramble exactly as TX does (pad to full OFDM boundary first, then scramble)
-        let mut all_coded_bits = vec![0u8; total_data_syms * bits_per_ofdm];
+        // Scramble exactly as TX does
+        let mut all_coded_bits = vec![0u8; data_syms_per_pass * bits_per_ofdm];
         G3ruhScrambler::new().scramble_bits(&mut all_coded_bits);
 
+        let bits_to_scattered = |bits: &[u8], sym_idx: usize| -> Vec<Complex32> {
+            let n_data = crate::ofdm::drm_pilots::drm_num_data(sym_idx);
+            let data_sc: Vec<Complex32> = (0..n_data)
+                .map(|s| {
+                    let b = bits.get(s * bps).copied().unwrap_or(0);
+                    Complex32::new(if b == 0 { 1.0 } else { -1.0 }, 0.0)
+                })
+                .collect();
+            crate::ofdm::tx::ofdm_modulate_scattered(&data_sc, sym_idx)
+        };
+
         let mut ofdm_syms: Vec<Vec<Complex32>> = Vec::new();
-        for sym_idx in 0..total_data_syms {
-            let start    = sym_idx * bits_per_ofdm;
-            let end      = (start + bits_per_ofdm).min(all_coded_bits.len());
-            let sym_bits = &all_coded_bits[start..end];
-            ofdm_syms.push(bits_to_ofdm_symbol(sym_bits, bps));
+        // Pass 1 (RUNIN)
+        for i in 0..data_syms_per_pass {
+            let start = i * bits_per_ofdm;
+            let end   = (start + bits_per_ofdm).min(all_coded_bits.len());
+            ofdm_syms.push(bits_to_scattered(&all_coded_bits[start..end], preamble_syms + i));
+        }
+        // Pass 2 (DATA) — identical bits, different sym_idx
+        for i in 0..data_syms_per_pass {
+            let start = i * bits_per_ofdm;
+            let end   = (start + bits_per_ofdm).min(all_coded_bits.len());
+            ofdm_syms.push(bits_to_scattered(&all_coded_bits[start..end], preamble_syms + data_syms_per_pass + i));
         }
 
-        // EOT CRC32: computed over the full rs_payload that FrameReceiver
-        // assembles — M × rs_k bytes (2×191=382 zero bytes for the all-zero case).
-        let rs_payload_bytes = m * rs_k; // 382
+        // EOT CRC32
+        let rs_payload_bytes = m * rs_k;
         let crc = crc32_ieee(&vec![0u8; rs_payload_bytes]);
-        let mut eot_bits = vec![0u8; NUM_DATA];
-        for i in 0..32 {
-            eot_bits[i] = ((crc >> (31 - i)) & 1) as u8;
-        }
-        ofdm_syms.push(bits_to_ofdm_symbol(&eot_bits, 1));
+        let eot_sym_idx = preamble_syms + 2 * data_syms_per_pass;
+        let n_eot_data = crate::ofdm::drm_pilots::drm_num_data(eot_sym_idx);
+        let mut eot_data: Vec<Complex32> = (0..n_eot_data)
+            .map(|i| {
+                if i < 32 {
+                    let bit = ((crc >> (31 - i)) & 1) as u8;
+                    Complex32::new(if bit == 0 { 1.0 } else { -1.0 }, 0.0)
+                } else {
+                    Complex32::new(1.0, 0.0)
+                }
+            })
+            .collect();
+        ofdm_syms.push(crate::ofdm::tx::ofdm_modulate_scattered(&eot_data, eot_sym_idx));
 
         // ── Feed to FrameReceiver ─────────────────────────────────────────────
         let header = ModeHeader {
@@ -973,7 +964,7 @@ mod tests {
         let h_est = flat_channel_est();
         let mut rx = FrameReceiver::new(&header, &h_est, 0.1);
 
-        assert_eq!(rx.total_data_syms, total_data_syms,
+        assert_eq!(rx.total_data_syms, 2 * data_syms_per_pass,
             "FrameReceiver and test disagree on data symbol count");
 
         let mut result = None;
@@ -988,7 +979,6 @@ mod tests {
         let frame = result.expect("FrameReceiver should have returned FrameComplete");
         assert!(frame.crc32_ok, "EOT CRC32 must pass on noiseless loopback");
         assert_eq!(frame.packets_ok, 1, "only the real RS packet counts");
-        // The first rs_k bytes of the payload are the decoded real packet (zeros).
         assert_eq!(&frame.payload[..rs_k], &vec![0u8; rs_k][..],
             "decoded payload must match original");
     }

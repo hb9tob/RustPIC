@@ -22,7 +22,6 @@ use rustfft::FftPlanner;
 use rustpic::{
     fec::rs::RsLevel,
     ofdm::{
-        beacon::build_beacon,
         params::{CP_LEN, FFT_SIZE, SAMPLE_RATE, SYMBOL_LEN},
         rx::{
             frame::{crc32_ieee, max_packets_per_frame},
@@ -41,7 +40,6 @@ struct Cfg {
     modulation: Modulation,
     ldpc_rate:  LdpcRate,
     rs_level:   RsLevel,
-    resync:     bool,
     papr_clip:  Option<f32>,  // soft-clip threshold in dB above RMS; None = no clipping
     gain_db:    f32,           // additional gain applied after peak normalisation (dB)
     deemph_tau: Option<f32>,  // de-emphasis time constant in µs; None = disabled
@@ -58,7 +56,6 @@ impl Default for Cfg {
             modulation: Modulation::Qpsk,
             ldpc_rate:  LdpcRate::R3_4,
             rs_level:   RsLevel::L1,
-            resync:     false, // off — ZC resyncs disrupt scattered-pilot tracking
             papr_clip:  Some(12.0),  // default on — soft tanh clip at RMS+12 dB
             gain_db:    0.0,
             deemph_tau: None,
@@ -77,8 +74,6 @@ fn parse_args() -> Cfg {
             "--input"     => { i += 1; cfg.input    = args[i].clone(); }
             "--output"    => { i += 1; cfg.output   = args[i].clone(); }
             "--callsign"  => { i += 1; cfg.callsign = args[i].to_uppercase(); }
-            "--resync"    => { cfg.resync = true; }
-            "--no-resync" => { cfg.resync = false; }
             "--papr" => {
                 i += 1;
                 cfg.papr_clip = Some(args[i].parse::<f32>()
@@ -157,7 +152,6 @@ fn print_help() {
     println!("  --mod       <mod>    bpsk | qpsk | 16qam | 32qam | 64qam  [default: qpsk]");
     println!("  --rate      <rate>   1/2 | 2/3 | 3/4 | 5/6                [default: 3/4]");
     println!("  --rs        <0|1|2>  RS protection level                   [default: 1]");
-    println!("  --no-resync          Disable re-sync ZC symbols (on by default)");
     println!("  --papr  <dB>         PAPR soft-clip threshold dB above RMS [default: 12]");
     println!("  --no-papr            Disable PAPR clipping");
     println!("  --deemph <µs>        Apply TX de-emphasis before FM radio microphone input.");
@@ -257,7 +251,6 @@ fn main() {
         modulation: cfg.modulation,
         ldpc_rate:  cfg.ldpc_rate,
         rs_level:   cfg.rs_level,
-        has_resync: cfg.resync,
     };
 
     let frames  = build_transmission(&payload, &frame_cfg);
@@ -265,14 +258,22 @@ fn main() {
     let (_, rs_k, _) = cfg.rs_level.params();
     let pkt_per_frame = max_packets_per_frame(cfg.modulation, cfg.ldpc_rate, cfg.rs_level);
 
-    // Build beacon (1 kHz tone + ZC pair + ANN with callsign/mode/filename).
-    let mode_str = format!("{} {}", mod_label(cfg.modulation), rate_label(cfg.ldpc_rate));
-    let beacon = build_beacon(&cfg.callsign, &name, &mode_str);
+    // No beacon — pilot-based sync doesn't need a ZC preamble.
+    // Callsign and mode info will be embedded in the mode header / payload.
 
-    // Flatten beacon + all super-frames; take only the real part (baseband audio).
-    let mut samples_f: Vec<f32> = beacon.iter().map(|s| s.re)
-        .chain(frames.iter().flat_map(|f| f.iter().map(|s| s.re)))
-        .collect();
+    // RUNIN silence: gives the RX Hilbert filter time to settle before the
+    // first mode header symbol.
+    let runin_samples = SYMBOL_LEN; // ~26.7 ms warm-up for Hilbert FIR
+
+    // RUNOUT: extra silence after the last symbol so the Hilbert FIR and
+    // any IIR filters can flush, ensuring the last data/EOT symbol is fully
+    // received (same concept as QSSTV's RUNOUT segments).
+    let runout_samples = 2 * SYMBOL_LEN; // ~53 ms tail
+
+    // Flatten all super-frames; take only the real part (baseband audio).
+    let mut samples_f: Vec<f32> = vec![0.0_f32; runin_samples];
+    samples_f.extend(frames.iter().flat_map(|f| f.iter().map(|s| s.re)));
+    samples_f.extend(vec![0.0_f32; runout_samples]);
     let n_base_samples = samples_f.len();
 
     // OFDM symbol-boundary smoothing — kills the broadband spectral leakage
@@ -346,26 +347,21 @@ fn main() {
 
     let duration_s = n_base_samples as f64 / SAMPLE_RATE as f64;
     let wav_bytes  = std::fs::metadata(&cfg.output).map(|m| m.len()).unwrap_or(0);
-    use rustpic::ofdm::{beacon::BEACON_TOTAL_SYMS, params::SYMBOL_LEN as SYM};
-    let beacon_ms = BEACON_TOTAL_SYMS * SYM * 1000 / SAMPLE_RATE as usize;
-
     println!("RustPIC TX");
     println!("  Callsign : {}", cfg.callsign);
     println!("  Input    : {} ({} bytes)", cfg.input, raw.len());
-    println!("  Mode     : {}  {}  RS-L{}{}{}{}{}",
+    println!("  Mode     : {}  {}  RS-L{}{}{}{}",
         mod_label(cfg.modulation),
         rate_label(cfg.ldpc_rate),
         match cfg.rs_level { RsLevel::L0 => "0", RsLevel::L1 => "1", RsLevel::L2 => "2" },
-        if cfg.resync { "  resync" } else { "" },
         if let Some(db) = cfg.papr_clip { format!("  papr-clip={db}dB") } else { String::new() },
         if let Some(tau) = cfg.deemph_tau { format!("  deemph={tau}µs") } else { String::new() },
         if cfg.gain_db != 0.0 { format!("  gain={:+.1}dB", cfg.gain_db) } else { String::new() });
     println!("  BPF      : {}", if cfg.bandpass { "280-2620 Hz (QSSTV-style)" } else { "off" });
     println!("  Smooth   : {}", if cfg.smooth_tw > 0 { format!("{} samples raised-cosine taper", cfg.smooth_tw) } else { "off".to_string() });
     println!("  RS pkts  : {} total, ≤ {}/frame, rs_k={}", (raw.len() + 4).div_ceil(rs_k), pkt_per_frame, rs_k);
-    println!("  Beacon   : {} ms (1 kHz VOX tone + ZC + indicatif)", beacon_ms);
     println!("  Frames   : {}", n_frames);
-    println!("  Duration : {:.1} s  ({} samples @ {} Hz, beacon included)", duration_s, n_base_samples, SAMPLE_RATE as u32);
+    println!("  Duration : {:.1} s  ({} samples @ {} Hz)", duration_s, n_base_samples, SAMPLE_RATE as u32);
     println!("  Output   : {}  ({} bytes, 48 kHz 16-bit stereo)", cfg.output, wav_bytes);
 }
 

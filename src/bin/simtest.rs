@@ -27,12 +27,12 @@ use rand::{rngs::StdRng, SeedableRng};
 use rustpic::{
     fec::rs::RsLevel,
     ofdm::{
-        params::{CP_LEN, RESYNC_PERIOD, SYMBOL_LEN},
+        params::{CP_LEN, SYMBOL_LEN},
         rx::{
             frame::{FrameReceiver, PushResult, TransmissionReceiver, TxPushResult,
                     max_packets_per_frame},
             mode_detect::{decode_mode_header, LdpcRate, Modulation},
-            sync::{correct_cfo, find_resync_zc, ZcCorrelator},
+            sync::{correct_cfo, ZcCorrelator},
         },
         tx::frame::{build_transmission, FrameConfig},
     },
@@ -52,7 +52,6 @@ struct Config {
     modulation:   Modulation,
     rs_level:     RsLevel,
     payload_size: usize,
-    has_resync:   bool,
 }
 
 impl Default for Config {
@@ -69,7 +68,6 @@ impl Default for Config {
             modulation:   Modulation::Bpsk,
             rs_level:     RsLevel::L1,
             payload_size: rs_k,
-            has_resync:   false,
         }
     }
 }
@@ -87,7 +85,6 @@ fn parse_args() -> Config {
             "--guard"    => { i += 1; cfg.guard         = args[i].parse().expect("--guard"); }
             "--runs"     => { i += 1; cfg.runs          = args[i].parse().expect("--runs"); }
             "--payload-size" => { i += 1; cfg.payload_size = args[i].parse().expect("--payload-size"); }
-            "--resync"   => { cfg.has_resync = true; }
             "--rs-level" => {
                 i += 1;
                 cfg.rs_level = match args[i].as_str() {
@@ -142,7 +139,6 @@ fn print_help() {
     println!("  --mod MOD          Modulation: bpsk qpsk 16qam 32qam 64qam  [default: bpsk]");
     println!("  --rs-level N       RS protection: 0=L0 1=L1 2=L2   [default: 1]");
     println!("  --payload-size N   Payload bytes                  [default: 191]");
-    println!("  --resync           Enable re-sync ZC symbols");
 }
 
 // ── Per-frame result ──────────────────────────────────────────────────────────
@@ -221,135 +217,19 @@ fn run_transmission(
                                 .saturating_sub(header.packet_offset) as usize;
         let pkts_this      = remaining.min(max_per);
 
-        // Track the current read position (in samples) within rx_buf.
-        //
-        // Clock-drift tracking strategy:
-        //   At each resync ZC we find its exact integer position (found_int) and
-        //   update rate_est from the absolute origin for long-term accuracy.
-        //
-        //   Data symbols after a resync are placed at found_int + s×SYMBOL_LEN
-        //   (integer steps from the integer ZC position), NOT at
-        //   round(found_exact + s×SL_eff).  The reason: when found_frac ≈ ±0.5,
-        //   round(found_exact + SL_eff) can differ from found_int + SYMBOL_LEN by
-        //   1 sample, causing a ~1-sample timing discontinuity between the ZC
-        //   channel estimate and the first data symbol.  At bin 81, 1 sample ≈
-        //   114° — catastrophic for 16-QAM.  Using integer steps avoids this.
-        //   The residual drift (0.003 samples/sym at 10 ppm) is handled by the
-        //   pilot EMA.
-        let total_data   = rx.total_data_syms();
-        // Absolute sample index of ZC#1 in rx_buf (origin of all timing math).
-        let origin: i64  = sync.preamble_start as i64;
-        // Estimated RX/TX sample-rate ratio (updated after each resync ZC).
-        let mut rate_est: f64 = 1.0;
-        // k_sym: absolute symbol count from ZC#1 (0 = ZC#1, 1 = ZC#2, 2 = header,
-        // 3 = first data symbol, …).
-        let mut k_sym: i64    = 3; // loop enters at first data symbol
-        // Mirror FrameReceiver's syms_in_group counter to detect resync slots.
-        let mut syms_in_group: usize = 0;
-        let mut data_received:  usize = 0;
+        // Simple symbol-by-symbol processing — no resync ZCs.
+        // Data symbols are at fixed positions after the mode header.
+        let data_start = hdr_start + SYMBOL_LEN;
         let mut frame_result = None;
-        // Integer position of the most recent resync ZC (None = use rate_est from origin).
-        let mut last_resync_int: Option<(usize, i64)> = None; // (found_int, k_sym_at_resync)
-        let debug2 = std::env::var("SIMTEST_DEBUG2").is_ok();
 
-        for _sym_idx in 0..n_expected {
-            // Determine symbol type, mirroring FrameReceiver::push_symbol logic.
-            let is_eot    = data_received >= total_data;
-            let is_resync = !is_eot
-                && header.has_resync
-                && syms_in_group == RESYNC_PERIOD;
-
-            // Predicted position of the current symbol.
-            //
-            // For data symbols after a resync: step by exactly SYMBOL_LEN from the
-            // integer ZC position.  This avoids the rounding-boundary discontinuity
-            // described above.  For the pre-resync stretch and the resync ZC itself
-            // (found by correlator search), use rate_est from the absolute origin.
-            let actual_pos = if let Some((ri, rk)) = last_resync_int {
-                // Integer steps from the last found ZC position.
-                ri + (k_sym - rk) as usize * SYMBOL_LEN
-            } else {
-                ((origin as f64
-                  + k_sym as f64 * SYMBOL_LEN as f64 / rate_est)
-                 .round() as i64)
-                .max(0) as usize
-            };
-            // Buffer was pre-padded to nominal_end; actual_pos should always be valid.
-
-            let sym_pos = if is_resync {
-                // Find the actual ZC position with sub-sample precision.
-                if let Some((found_int, found_frac)) =
-                    find_resync_zc(&rx_buf, actual_pos, 64, 0.20)
-                {
-                    let found_exact = found_int as f64 + found_frac as f64;
-
-                    // Update rate estimate from absolute origin for long-term accuracy.
-                    let nominal = k_sym as f64 * SYMBOL_LEN as f64;
-                    let observed = found_exact - origin as f64;
-                    if observed > 0.0 {
-                        rate_est = nominal / observed;
-                    }
-
-                    // When found_frac < 0, found_int = ceil(true_pos): the FFT
-                    // window would extend past the ZC DFT boundary into the next
-                    // symbol's CP, causing ISI in the channel estimate.  Shift
-                    // down by one sample so we always use floor(true_pos), which
-                    // reads into the ZC's own cyclic prefix instead (safe).
-                    let zc_pos = if found_frac < 0.0 && found_int > 0 {
-                        found_int - 1
-                    } else {
-                        found_int
-                    };
-
-                    // Record the ZC position; subsequent data symbols will
-                    // be positioned relative to it with integer steps.
-                    last_resync_int = Some((zc_pos, k_sym));
-
-                    // The simtest corrects timing in the time domain; no extra
-                    // frequency-domain drift correction needed.
-                    rx.set_timing_drift_per_sym(0.0);
-
-                    if debug2 && data_received + 6 >= total_data {
-                        eprintln!("  resync k_sym={k_sym} actual_pos={actual_pos} found_int={found_int} found_frac={found_frac:.3} zc_pos={zc_pos} data_received={data_received}/{total_data}");
-                    }
-                    zc_pos
-                } else {
-                    if debug2 {
-                        eprintln!("  resync k_sym={k_sym} actual_pos={actual_pos} FIND_FAILED data_received={data_received}/{total_data}");
-                    }
-                    actual_pos
-                }
-            } else {
-                if debug2 && data_received + 6 >= total_data {
-                    let rms: f32 = rx_buf[actual_pos..actual_pos+SYMBOL_LEN]
-                        .iter().map(|s| s.norm_sqr()).sum::<f32>() / SYMBOL_LEN as f32;
-                    // Also check nominal (no-drift) position
-                    let nominal_pos = ((origin as f64 + k_sym as f64 * SYMBOL_LEN as f64).round() as i64).max(0) as usize;
-                    let rms_nom: f32 = if nominal_pos + SYMBOL_LEN <= rx_buf.len() {
-                        rx_buf[nominal_pos..nominal_pos+SYMBOL_LEN]
-                            .iter().map(|s| s.norm_sqr()).sum::<f32>() / SYMBOL_LEN as f32
-                    } else { 0.0 };
-                    eprintln!("  data  k_sym={k_sym} sym_pos={actual_pos}(nom={nominal_pos}) data_idx={data_received}/{total_data} rms={:.4} rms_nom={:.4} is_eot={is_eot}",
-                        rms.sqrt(), rms_nom.sqrt());
-                }
-                actual_pos
-            };
-
+        for i in 0..n_expected {
+            let sym_pos = data_start + i * SYMBOL_LEN;
             if sym_pos + SYMBOL_LEN > rx_buf.len() { return None; }
             match rx.push_symbol(&rx_buf[sym_pos..sym_pos + SYMBOL_LEN]) {
                 PushResult::NeedMore             => {}
                 PushResult::FrameComplete(frame) => { frame_result = Some(frame); break; }
                 PushResult::Error(_)             => return None,
             }
-
-            // Update local state mirrors
-            if is_resync {
-                syms_in_group = 0;
-            } else if !is_eot {
-                data_received  += 1;
-                syms_in_group  += 1;
-            }
-            k_sym += 1;
         }
 
         let frame = frame_result?;
@@ -370,9 +250,7 @@ fn run_transmission(
                 m.ldpc_converged, m.ldpc_total, frame.packets_ok, pkts_this,
                 m.rs_margin_frac, m.failing_block_indices);
         }
-        if debug2 && !frame.crc32_ok {
-            eprintln!("  -> CRC FAIL frame={} origin={origin} total_data={total_data}", frames_processed - 1);
-        }
+
 
         let is_complete = matches!(tx_rx.push_frame(frame, &header), TxPushResult::Complete(_));
         if is_complete { break; }
@@ -437,7 +315,6 @@ fn main() {
         modulation: cfg.modulation,
         ldpc_rate:  cfg.ldpc_rate,
         rs_level:   cfg.rs_level,
-        has_resync: cfg.has_resync,
     };
 
     // Deterministic non-trivial payload (pseudo-random bytes)
@@ -448,8 +325,8 @@ fn main() {
     // ── Header ────────────────────────────────────────────────────────────────
     println!("RustPIC channel simulation");
     println!(
-        "  modulation: {:?}  LDPC: {:?}  RS: L{}  resync: {}",
-        cfg.modulation, cfg.ldpc_rate, cfg.rs_level as u8, cfg.has_resync
+        "  modulation: {:?}  LDPC: {:?}  RS: L{}",
+        cfg.modulation, cfg.ldpc_rate, cfg.rs_level as u8
     );
     println!(
         "  ppm ±{:.0}  guard 0..{}  {}/SNR  payload {} B",

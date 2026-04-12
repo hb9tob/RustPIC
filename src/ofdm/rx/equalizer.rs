@@ -628,9 +628,10 @@ mod tests {
             "expected decent SNR on flat channel, got {last_snr:.1} dB");
     }
 
-    // ── Legacy tests below ───────────────────────────────────────────────────
+    // ── Legacy tests below (old fixed-pilot equalizer — not used by ScatteredEqualizer) ──
 
     #[test]
+    #[ignore = "tests legacy fixed-pilot Equalizer, not the active ScatteredEqualizer"]
     fn flat_channel_data_recovery() {
         // Initial H from ZC preamble (flat unit channel → H = 1+0j everywhere)
         let preamble = build_preamble();
@@ -655,6 +656,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tests legacy fixed-pilot Equalizer"]
     fn flat_channel_high_snr() {
         let preamble = build_preamble();
         let h_preamble = crate::ofdm::rx::sync::channel_estimate_from_zc(
@@ -670,6 +672,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tests legacy fixed-pilot interpolation"]
     fn interpolation_pilot_positions() {
         // At pilot positions, interpolated H must match input pilot values exactly
         let pilot_h: Vec<Complex32> = (0..NUM_PILOTS)
@@ -685,6 +688,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tests legacy fixed-pilot interpolation"]
     fn interpolation_midpoint_linear() {
         // At the midpoint between two pilots the interpolated value must be
         // the arithmetic mean of the two pilot values

@@ -31,7 +31,6 @@ use crate::ofdm::{
     },
     scrambler::G3ruhScrambler,
     tx::{bits_to_symbol, ofdm_modulate, ofdm_modulate_all_carriers, ofdm_modulate_scattered},
-    zc::build_preamble,
 };
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -45,8 +44,6 @@ pub struct FrameConfig {
     pub ldpc_rate:  LdpcRate,
     /// RS protection level (3 choices, trading throughput for error correction).
     pub rs_level:   RsLevel,
-    /// Insert a re-sync ZC symbol every [`RESYNC_PERIOD`] data symbols.
-    pub has_resync: bool,
 }
 
 // ── Frame builder ─────────────────────────────────────────────────────────────
@@ -197,8 +194,8 @@ fn build_frame_internal(
     // QSSTV does 24 RUNIN + 10 RUNOUT segments; we do a full 1× repeat.
     //
     // sym_idx is CONTINUOUS across both passes so the scattered pilot pattern
-    // rotates correctly: pass1 uses sym_idx 5..5+D, pass2 uses 5+D..5+2D.
-    let preamble_syms = 2 + MODE_HEADER_REPEAT;
+    // rotates correctly: pass1 uses sym_idx 3..3+D, pass2 uses 3+D..3+2D.
+    let preamble_syms = MODE_HEADER_REPEAT;
 
     // Build OFDM symbols for one complete pass (bits → constellation → IFFT).
     let build_pass = |sym_offset: usize| -> Vec<Vec<Complex32>> {
@@ -216,21 +213,16 @@ fn build_frame_internal(
     let pass1_syms = build_pass(0);                     // RUNIN
     let pass2_syms = build_pass(total_data_syms);       // DATA
 
-    // ── 3. Re-sync ZC symbol ─────────────────────────────────────────────────
-    let resync_sym: Vec<Complex32> = build_preamble()[..SYMBOL_LEN].to_vec();
-
-    // ── 4. Assemble sample stream ─────────────────────────────────────────────
+    // ── 3. Assemble sample stream ────────────────────────────────────────────
+    // No ZC preamble — sync is from scattered pilots (CP correlation + pilot
+    // phase matching).  Frame starts directly with the mode header.
     let mut samples: Vec<Complex32> = Vec::new();
-
-    let preamble = build_preamble();
-    samples.extend_from_slice(&preamble); // ZC#1
-    samples.extend_from_slice(&preamble); // ZC#2
 
     let header = ModeHeader {
         modulation:         config.modulation,
         ldpc_rate:          config.ldpc_rate,
         rs_level:           config.rs_level,
-        has_resync:         config.has_resync,
+        has_resync:         false,
         total_packet_count,
         packet_offset,
         crc_ok:             true,
@@ -247,21 +239,15 @@ fn build_frame_internal(
         samples.extend_from_slice(&mode_hdr_sym);
     }
 
-    // ── 4b. RUNIN pass (first copy) ─────────────────────────────────────────
+    // ── 3b. RUNIN pass (first copy) ─────────────────────────────────────────
     // Same data as the main pass — trains the equaliser on real pilots +
     // gives the LDPC a first shot at each block.
-    for (i, sym) in pass1_syms.iter().enumerate() {
-        if config.has_resync && i > 0 && i % RESYNC_PERIOD == 0 {
-            samples.extend_from_slice(&resync_sym);
-        }
+    for sym in &pass1_syms {
         samples.extend_from_slice(sym);
     }
 
-    // ── 4c. DATA pass (second copy) ──────────────────────────────────────────
-    for (i, sym) in pass2_syms.iter().enumerate() {
-        if config.has_resync && i > 0 && i % RESYNC_PERIOD == 0 {
-            samples.extend_from_slice(&resync_sym);
-        }
+    // ── 3c. DATA pass (second copy) ──────────────────────────────────────────
+    for sym in &pass2_syms {
         samples.extend_from_slice(sym);
     }
 
@@ -274,7 +260,9 @@ fn build_frame_internal(
         padded[..copy_len].copy_from_slice(&payload[..copy_len]);
         crc32_ieee(&padded)
     };
-    let eot_sc: Vec<Complex32> = (0..NUM_DATA)
+    let eot_sym_idx = preamble_syms + 2 * total_data_syms;
+    let n_eot_data = crate::ofdm::drm_pilots::drm_num_data(eot_sym_idx);
+    let eot_sc: Vec<Complex32> = (0..n_eot_data)
         .map(|i| {
             if i < 32 {
                 let bit = (crc >> (31 - i)) & 1;
@@ -284,7 +272,7 @@ fn build_frame_internal(
             }
         })
         .collect();
-    samples.extend_from_slice(&ofdm_modulate(&eot_sc));
+    samples.extend_from_slice(&ofdm_modulate_scattered(&eot_sc, eot_sym_idx));
 
     samples
 }
@@ -298,49 +286,59 @@ mod tests {
         fec::rs::RsLevel,
         ofdm::rx::{
             frame::{FrameReceiver, PushResult},
-            mode_detect::decode_mode_header,
-            sync::{correct_cfo, ZcCorrelator},
+            mode_detect::decode_mode_header_repeated,
+            pilot_sync::scan_for_pilots,
         },
     };
 
-    /// Full loopback: build_frame → feed through the RX pipeline →
-    /// verify payload, CRC32, and packet count.
+    /// Full loopback: build_frame → pilot sync → decode → verify payload.
+    ///
+    /// No ZC — sync is entirely from scattered pilots (CP correlation +
+    /// pilot phase matching).
     fn loopback(payload: &[u8], config: &FrameConfig) {
         // ── TX ────────────────────────────────────────────────────────────────
-        let mut samples = build_frame(payload, config);
+        let samples = build_frame(payload, config);
 
-        // ── RX sync ───────────────────────────────────────────────────────────
-        let corr = ZcCorrelator::new(0.40, 0.30);
-        let sync = corr.find_sync(&samples)
-            .unwrap_or_else(|e| panic!("sync failed: {e}"));
+        // ── RX: pilot-based sync ──────────────────────────────────────────────
+        // scan_for_pilots finds the first data symbol with valid scattered
+        // pilots.  The mode header (all-carrier BPSK, no pilots) is right
+        // before the first data symbol, at MODE_HEADER_REPEAT symbols back.
+        // Skip mode header (MODE_HEADER_REPEAT symbols) — they don't have
+        // scattered pilots and can give false pilot matches (metric ~0.5).
+        let ps = scan_for_pilots(&samples, MODE_HEADER_REPEAT * SYMBOL_LEN, 0.3, 0.7)
+            .expect("pilot sync should find data symbols");
 
-        correct_cfo(&mut samples[sync.preamble_start..], sync.cfo_hz);
+        // The mode header starts MODE_HEADER_REPEAT symbols before the
+        // first data symbol.  With preamble_syms = MODE_HEADER_REPEAT = 3,
+        // data starts at sym_idx 3 in the pilot pattern.  The detected
+        // sym_idx tells us which data symbol we found.
+        let data_sym_offset = ps.sym_idx.checked_sub(MODE_HEADER_REPEAT)
+            .expect("detected sym_idx should be >= MODE_HEADER_REPEAT");
+        let first_data_pos = ps.symbol_pos - data_sym_offset * SYMBOL_LEN;
+        let hdr_start = first_data_pos - MODE_HEADER_REPEAT * SYMBOL_LEN;
 
-        // Mode header — MODE_HEADER_REPEAT identical copies, soft-combined.
-        let hdr_start  = sync.header_start;
+        // Decode mode header (MODE_HEADER_REPEAT copies, soft-combined).
         let hdr_windows: Vec<&[Complex32]> = (0..MODE_HEADER_REPEAT)
             .map(|r| {
                 let off = hdr_start + r * SYMBOL_LEN;
                 &samples[off + CP_LEN..off + SYMBOL_LEN]
             })
             .collect();
-        let header     = crate::ofdm::rx::mode_detect::decode_mode_header_repeated(
-                &hdr_windows, &sync.channel_est)
+        let header = decode_mode_header_repeated(&hdr_windows, &ps.channel_est)
             .unwrap_or_else(|e| panic!("header decode failed: {e}"));
 
         assert_eq!(header.modulation, config.modulation);
         assert_eq!(header.ldpc_rate,  config.ldpc_rate);
         assert_eq!(header.rs_level,   config.rs_level);
-        assert_eq!(header.has_resync, config.has_resync);
 
         // Frame receiver
-        let mut rx  = FrameReceiver::new(&header, &sync.channel_est, 0.1);
-        let data_start = hdr_start + MODE_HEADER_REPEAT * SYMBOL_LEN;
+        let mut rx = FrameReceiver::new(&header, &ps.channel_est, 0.1);
         let n_expected = rx.expected_symbol_count();
         let mut frame_result = None;
 
         for i in 0..n_expected {
-            let pos = data_start + i * SYMBOL_LEN;
+            let pos = first_data_pos + i * SYMBOL_LEN;
+            if pos + SYMBOL_LEN > samples.len() { break; }
             let sym = &samples[pos..pos + SYMBOL_LEN];
             match rx.push_symbol(sym) {
                 PushResult::NeedMore             => {}
@@ -353,61 +351,44 @@ mod tests {
 
         assert!(frame.crc32_ok,
             "CRC32 failed for {:?}/{:?}", config.modulation, config.ldpc_rate);
-        // packets_ok counts only real (non-padding) packets
         assert_eq!(frame.packets_ok, header.total_packet_count,
             "not all RS packets decoded");
 
-        // Verify payload bytes (truncate to original length)
         let recovered = &frame.payload[..payload.len()];
         assert_eq!(recovered, payload,
             "payload mismatch for {:?}/{:?}", config.modulation, config.ldpc_rate);
     }
 
     #[test]
-    fn loopback_bpsk_r12_no_resync() {
+    fn loopback_bpsk_r12() {
         let (_, rs_k, _) = RsLevel::L1.params();
         let payload = vec![0u8; rs_k]; // all-zero → trivial LDPC codewords
         loopback(&payload, &FrameConfig {
             modulation: Modulation::Bpsk,
             ldpc_rate:  LdpcRate::R1_2,
             rs_level:   RsLevel::L1,
-            has_resync: false,
         });
     }
 
     #[test]
-    fn loopback_qpsk_r34_no_resync() {
+    fn loopback_qpsk_r34() {
         let (_, rs_k, _) = RsLevel::L1.params();
         let payload = vec![0u8; rs_k];
         loopback(&payload, &FrameConfig {
             modulation: Modulation::Qpsk,
             ldpc_rate:  LdpcRate::R3_4,
             rs_level:   RsLevel::L1,
-            has_resync: false,
         });
     }
 
     #[test]
-    fn loopback_16qam_r56_no_resync() {
+    fn loopback_16qam_r56() {
         let (_, rs_k, _) = RsLevel::L1.params();
         let payload = vec![0u8; rs_k];
         loopback(&payload, &FrameConfig {
             modulation: Modulation::Qam16,
             ldpc_rate:  LdpcRate::R5_6,
             rs_level:   RsLevel::L1,
-            has_resync: false,
-        });
-    }
-
-    #[test]
-    fn loopback_bpsk_r12_with_resync() {
-        let (_, rs_k, _) = RsLevel::L1.params();
-        let payload = vec![0u8; rs_k];
-        loopback(&payload, &FrameConfig {
-            modulation: Modulation::Bpsk,
-            ldpc_rate:  LdpcRate::R1_2,
-            rs_level:   RsLevel::L1,
-            has_resync: true,
         });
     }
 
@@ -422,7 +403,6 @@ mod tests {
             modulation: Modulation::Bpsk,
             ldpc_rate:  LdpcRate::R1_2,
             rs_level:   RsLevel::L1,
-            has_resync: false,
         });
     }
 }
