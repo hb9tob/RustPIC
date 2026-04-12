@@ -130,6 +130,10 @@ pub struct ZcCorrelator {
     /// Pre-computed reference energy ‖p‖.
     ref_energy: f32,
 
+    /// ZC frequency-domain reference (unit-amplitude complex values for the
+    /// 42 active bins).  Conjugated for fast per-bin division.
+    zc_freq_conj: Vec<Complex32>,
+
     /// Primary detection threshold on ρ.
     threshold: f32,
 
@@ -154,7 +158,8 @@ impl ZcCorrelator {
             .collect();
         let ref_energy    = energy(&preamble_re);
         let preamble_conj = preamble_re.iter().map(|s| s.conj()).collect();
-        Self { preamble_conj, ref_energy, threshold, confirm_threshold }
+        let zc_freq_conj  = zc_freq_reference().into_iter().map(|s| s.conj()).collect();
+        Self { preamble_conj, ref_energy, zc_freq_conj, threshold, confirm_threshold }
     }
 
     // ── Main entry point ──────────────────────────────────────────────────────
@@ -182,19 +187,16 @@ impl ZcCorrelator {
             });
         }
 
-        // ── Stage 2: confirmation — search ±ZC2_SEARCH_RADIUS around ZC2 nominal ─
+        // ── Stage 2: freq-domain confirmation ─────────────────────────────────
         //
-        // The confirmation window allows for timing uncertainty introduced by
-        // the FM channel (phase distortion, de-emphasis) which can shift the
-        // correlation peak by up to a few hundred samples from the nominal
-        // ZC1 + SYMBOL_LEN position.
+        // ── Stage 2: time-domain confirmation + freq-domain rescue ────────────
         const ZC2_SEARCH_RADIUS: usize = 256;
         let mut best_pos       = best_pos;
         let mut best_metric    = best_metric;
         let mut zc2_start;
         let mut confirm_metric;
 
-        // Search ZC2 in [best_pos+SYMBOL_LEN-R, best_pos+SYMBOL_LEN+R].
+        // Time-domain confirm search for ZC#2.
         {
             let nom        = best_pos + SYMBOL_LEN;
             let search_lo  = nom.saturating_sub(ZC2_SEARCH_RADIUS);
@@ -208,14 +210,7 @@ impl ZcCorrelator {
             confirm_metric = best_m2;
         }
 
-        // With two identical preamble ZC symbols, the global peak can land on
-        // ZC#2 instead of ZC#1.  **Always** try the swap-back interpretation
-        // (treat best_pos as ZC#2 and look for ZC#1 one symbol earlier) and
-        // keep whichever interpretation gives the higher confirm metric.  The
-        // previous fallback only fired when `confirm_metric < confirm_threshold`,
-        // which missed cases where a random mode-header correlation sits in
-        // [confirm_threshold, 0.5] — the sync would return pointing at ZC#2
-        // and the frame decode would then garbage-process the wrong symbols.
+        // Swap-back: always try ZC#1 ← best_pos−SYMBOL_LEN, pick best.
         if best_pos >= SYMBOL_LEN {
             let nom2       = best_pos - SYMBOL_LEN;
             let search_lo2 = nom2.saturating_sub(ZC2_SEARCH_RADIUS);
@@ -225,14 +220,7 @@ impl ZcCorrelator {
                 .map(|d| (d, self.single_metric(&samples[d..d + SYMBOL_LEN])))
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
                 .unwrap_or((nom2, 0.0));
-
-            // The swap interpretation measures its own confirm metric at
-            // alt_pos + SYMBOL_LEN — that is simply `best_metric`, the
-            // correlation already found at the original global peak.
             let alt_confirm = best_metric;
-
-            // Pick the interpretation with the larger geometric-mean metric.
-            // Both must pass the primary threshold on ZC#1.
             let current_score = best_metric.min(confirm_metric);
             let alt_score     = alt_metric.min(alt_confirm);
             if alt_metric >= self.threshold && alt_score > current_score {
@@ -240,7 +228,6 @@ impl ZcCorrelator {
                 best_metric    = alt_metric;
                 zc2_start      = best_pos + SYMBOL_LEN;
                 confirm_metric = alt_confirm;
-                // Refine ZC2 position with a search around the nominal.
                 let nom3 = best_pos + SYMBOL_LEN;
                 let lo3  = nom3.saturating_sub(ZC2_SEARCH_RADIUS);
                 let hi3  = (nom3 + ZC2_SEARCH_RADIUS + 1)
@@ -251,6 +238,24 @@ impl ZcCorrelator {
                 {
                     zc2_start      = zc2s;
                     confirm_metric = m2;
+                }
+            }
+        }
+
+        // ── Freq-domain rescue ───────────────────────────────────────────────
+        // When time-domain confirm is mediocre (below the soft-sync threshold
+        // but above the hard floor), the frequency-domain differential-phase
+        // coherence metric gets a chance.  It's insensitive to the per-carrier
+        // amplitude distortion that degrades the time-domain correlation on
+        // NBFM channels (pre-emphasis, HPF rolloff, AGC).  If the freq-domain
+        // says the ZC is real, we upgrade the metrics.
+        if confirm_metric < SOFT_SYNC_M1_MIN && best_metric >= self.threshold {
+            let fm1 = self.freq_metric(&samples[best_pos..best_pos + SYMBOL_LEN]);
+            if fm1 >= 0.75 {
+                best_metric = best_metric.max(fm1);
+                let fm2 = self.freq_metric(&samples[zc2_start..zc2_start + SYMBOL_LEN]);
+                if fm2 >= 0.50 {
+                    confirm_metric = confirm_metric.max(fm2);
                 }
             }
         }
@@ -332,6 +337,50 @@ impl ZcCorrelator {
         let win_nrg = energy(window);
         // ρ ∈ [0, 1] by Cauchy–Schwarz
         corr.norm() / (win_nrg * self.ref_energy + 1e-12)
+    }
+
+    /// Frequency-domain ZC detection metric: insensitive to per-carrier
+    /// amplitude changes (pre-emphasis, HPF rolloff, AGC gain).
+    ///
+    /// Steps:
+    ///   1. FFT the 1024-sample window after stripping the CP.
+    ///   2. For each active bin k, compute R[k] = Y[k] × ZC*(k) — this is the
+    ///      per-carrier channel estimate if the window really is a ZC.
+    ///   3. Measure the **differential phase coherence** between adjacent
+    ///      carriers: `Σ R[k+1]·conj(R[k]) / (|R[k+1]|·|R[k]|)`.
+    ///
+    /// On a ZC through a smooth channel, the differential phase is nearly
+    /// constant (= the channel's per-carrier group delay) → coherence ≈ 1.
+    /// On random data, differential phases are random → coherence ≈ 0.
+    ///
+    /// Returns a value in [0, 1].
+    fn freq_metric(&self, window: &[Complex32]) -> f32 {
+        debug_assert!(window.len() >= SYMBOL_LEN);
+
+        // Strip CP, FFT.
+        let fft_in = &window[CP_LEN..CP_LEN + FFT_SIZE];
+        let mut buf: Vec<Complex32> = fft_in.to_vec();
+        let mut planner = FftPlanner::<f32>::new();
+        planner.plan_fft_forward(FFT_SIZE).process(&mut buf);
+        let scale = 1.0 / (FFT_SIZE as f32).sqrt();
+
+        // R[k] = Y[bin_k] × ZC*[k] — per-carrier channel if window is ZC.
+        let r: Vec<Complex32> = (0..NUM_CARRIERS)
+            .map(|k| buf[carrier_to_bin(k)] * scale * self.zc_freq_conj[k])
+            .collect();
+
+        // Differential phase coherence: Σ R[k+1]·conj(R[k]) / (|R[k+1]|·|R[k]|)
+        let mut sum = Complex32::new(0.0, 0.0);
+        let mut count = 0u32;
+        for k in 0..NUM_CARRIERS - 1 {
+            let mag_prod = r[k].norm() * r[k + 1].norm();
+            if mag_prod > 1e-12 {
+                sum += r[k + 1] * r[k].conj() / mag_prod;
+                count += 1;
+            }
+        }
+        if count == 0 { return 0.0; }
+        sum.norm() / count as f32
     }
 }
 
