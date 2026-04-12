@@ -418,39 +418,25 @@ impl FrameReceiver {
         }
 
         let llrs = demap(&eq.data, &eq.noise_var, self.header.modulation);
-        self.llr_buf.extend_from_slice(&llrs);
         self.data_syms_received += 1;
         self.total_syms_fed     += 1;
         self.syms_in_group      += 1;
 
-        // At the boundary between RUNIN (pass1) and DATA (pass2):
-        // attempt to decode all LDPC blocks from pass1. Blocks that converge
-        // are KEPT (their RS contribution is final). Blocks that fail are
-        // RESET — their LLR are discarded and pass2 gets a fresh shot with
-        // a converged equaliser.
-        if self.data_syms_received == self.data_syms_per_pass {
-            // Drain any remaining pass1 LLRs into LDPC blocks.
-            self.drain_ldpc_blocks();
-
-            // Save which blocks converged in pass1.
-            let pass1_converged = self.ldpc_block_converged.clone();
-
-            // Reset LLR buffer and block counter for pass2, but ONLY for
-            // blocks that FAILED in pass1. Converged blocks stay decoded.
-            self.llr_buf.clear();
-
-            // Reset the block drain counter to 0 so pass2 re-decodes
-            // ALL blocks. drain_ldpc_blocks will skip blocks already converged.
-            self.ldpc_blocks_decoded = 0;
-            self.syms_in_group = 0;
-
-            // Reset BER counters so only pass2 quality is reported.
-            self.channel_bit_errors = 0;
-            self.channel_bit_total = 0;
-
+        // Pass 1 (RUNIN): EQ training only — don't accumulate LLR or drain.
+        // The equaliser converges on the real scattered pilots. All decode
+        // happens in pass2 when the estimator is stable.
+        if self.data_syms_received <= self.data_syms_per_pass {
+            if self.data_syms_received == self.data_syms_per_pass {
+                // Boundary: reset for pass2.
+                self.syms_in_group = 0;
+                self.pilot_snr_sum = 0.0;
+                self.pilot_snr_count = 0;
+            }
             return PushResult::NeedMore;
         }
 
+        // Pass 2 (DATA): equaliser converged, decode for real.
+        self.llr_buf.extend_from_slice(&llrs);
         self.drain_ldpc_blocks();
 
         PushResult::NeedMore

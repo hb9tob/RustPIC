@@ -58,7 +58,7 @@ impl Default for Cfg {
             modulation: Modulation::Qpsk,
             ldpc_rate:  LdpcRate::R3_4,
             rs_level:   RsLevel::L1,
-            resync:     true,  // on by default — required for BPSK/QPSK over independent soundcards
+            resync:     false, // off — ZC resyncs disrupt scattered-pilot tracking
             papr_clip:  Some(12.0),  // default on — soft tanh clip at RMS+12 dB
             gain_db:    0.0,
             deemph_tau: None,
