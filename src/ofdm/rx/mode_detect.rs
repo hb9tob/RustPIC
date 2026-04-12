@@ -352,7 +352,7 @@ fn decode_header_from_bits(bits: &[u8]) -> Result<ModeHeader, ModeError> {
     let has_resync         = bits[7] == 1;
     let total_packet_count = bits_to_u16(&bits[8..20]);
     let packet_offset      = bits_to_u16(&bits[20..32]);
-    let crc_received       = bits_to_u16(&bits[32..40]); // 8-bit CRC
+    let crc_received       = bits_to_u16(&bits[32..48]); // 16-bit CRC
 
     let modulation = Modulation::from_u8(modulation_code)
         .ok_or(ModeError::InvalidModulation(modulation_code))?;
@@ -362,7 +362,7 @@ fn decode_header_from_bits(bits: &[u8]) -> Result<ModeHeader, ModeError> {
         .ok_or(ModeError::InvalidRsLevel(rs_level_code))?;
 
     let payload_bytes = bits_to_bytes(&bits[0..32]);
-    let crc_computed  = crc16_ccitt(&payload_bytes) & 0x00FF;
+    let crc_computed  = crc16_ccitt(&payload_bytes);
     let crc_ok        = crc_computed == crc_received;
 
     if !crc_ok {
@@ -423,7 +423,7 @@ fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
 pub fn encode_mode_header_bits(hdr: &ModeHeader) -> Vec<u8> {
     let mut bits = vec![0u8; MODE_HEADER_BITS];
 
-    // Field packing (MSB first) — 32 data bits + 8-bit CRC = 40 bits
+    // Field packing (MSB first) — 32 data bits + 16-bit CRC = 48 bits
     pack_bits_u8 (&mut bits[0..3],   hdr.modulation as u8,  3);
     pack_bits_u8 (&mut bits[3..5],   hdr.ldpc_rate  as u8,  2);
     pack_bits_u8 (&mut bits[5..7],   hdr.rs_level   as u8,  2);
@@ -431,16 +431,16 @@ pub fn encode_mode_header_bits(hdr: &ModeHeader) -> Vec<u8> {
     pack_bits    (&mut bits[8..20],  hdr.total_packet_count, 12);
     pack_bits    (&mut bits[20..32], hdr.packet_offset,      12);
 
-    // CRC-8: lower 8 bits of CRC-16/CCITT over bits 0–31
+    // Full CRC-16/CCITT over bits 0–31
     let payload_bytes = bits_to_bytes(&bits[0..32]);
-    let crc = crc16_ccitt(&payload_bytes) & 0x00FF;
-    pack_bits(&mut bits[32..40], crc, 8);
+    let crc = crc16_ccitt(&payload_bytes);
+    pack_bits(&mut bits[32..48], crc, 16);
 
     bits
 }
 
-/// Number of bits in the mode header (32 data + 8 CRC).
-pub const MODE_HEADER_BITS: usize = 40;
+/// Number of bits in the mode header (32 data + 16 CRC).
+pub const MODE_HEADER_BITS: usize = 48;
 
 /// Legacy BPSK encoder — kept for backward compatibility with old tests.
 pub fn encode_mode_header(hdr: &ModeHeader) -> Vec<f32> {

@@ -210,8 +210,39 @@ fn main() {
                 }
                 eprintln!();
             }
-            let fs = ps.symbol_pos.saturating_sub(ps.sym_idx * SYMBOL_LEN);
-            (fs, ps.channel_est, ps.cfo_hz)
+            // Try all possible frame_start candidates (sym_idx is modulo 15)
+            let base_fs = ps.symbol_pos.saturating_sub(ps.sym_idx * SYMBOL_LEN);
+            let mut best_fs = base_fs;
+            for attempt in 0..20 {
+                let fs = base_fs.saturating_sub(attempt * SYMBOLS_PER_FRAME * SYMBOL_LEN);
+                let hdr_pos = fs + RUNIN_PREAMBLE_SYMS * SYMBOL_LEN;
+                if hdr_pos + MODE_HEADER_REPEAT * SYMBOL_LEN > audio.len() { continue; }
+                // Quick mode header CRC check with minimal warm-up
+                let mut teq = ScatteredEqualizer::from_initial(&ps.channel_est, 0.5);
+                for i in 0..RUNIN_PREAMBLE_SYMS {
+                    let off = fs + i * SYMBOL_LEN;
+                    if off + SYMBOL_LEN <= audio.len() {
+                        let _ = teq.process(&audio[off..off + SYMBOL_LEN], i);
+                    }
+                }
+                let mut evecs: Vec<Vec<Complex32>> = Vec::new();
+                for r in 0..MODE_HEADER_REPEAT {
+                    let off = hdr_pos + r * SYMBOL_LEN;
+                    if off + SYMBOL_LEN <= audio.len() {
+                        let res = teq.process(&audio[off..off + SYMBOL_LEN], RUNIN_PREAMBLE_SYMS + r);
+                        evecs.push(res.data);
+                    }
+                }
+                // Soft-combine all copies and check CRC-16
+                if !evecs.is_empty() {
+                    let refs: Vec<&[Complex32]> = evecs.iter().map(|v| v.as_slice()).collect();
+                    if decode_mode_header_from_eq(&refs).is_ok() {
+                        best_fs = fs;
+                        break;
+                    }
+                }
+            }
+            (best_fs, ps.channel_est, ps.cfo_hz)
         };
 
         let frame_start = frame_start;
@@ -262,11 +293,13 @@ fn main() {
             Ok(h) => h,
             Err(e) => {
                 if std::env::var("SYNC_DEBUG").is_ok() {
-                    eprintln!("  [hdr] FAIL at frame_start={} hdr_off={}: {e}",
-                        frame_start, RUNIN_PREAMBLE_SYMS * SYMBOL_LEN);
+                    eprintln!("  [hdr] FAIL at frame_start={}: {e}", frame_start);
                 }
                 known_frame_start = None;
-                search_start += SYMBOL_LEN;
+                // Advance well past the detected position to avoid re-detecting
+                // the same symbol.  Jump by SYMBOLS_PER_FRAME to try the next
+                // possible frame alignment.
+                search_start = frame_start + SYMBOLS_PER_FRAME * SYMBOL_LEN;
                 continue;
             }
         };
