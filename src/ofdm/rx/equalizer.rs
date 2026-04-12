@@ -36,6 +36,7 @@
 use num_complex::Complex32;
 
 use crate::ofdm::params::*;
+use crate::ofdm::drm_pilots::{is_drm_pilot, drm_pilot_value, drm_pilot_indices, drm_num_data};
 use crate::ofdm::rx::ofdm_demodulate;
 use crate::ofdm::rx::sync::channel_estimate_from_zc;
 
@@ -361,7 +362,7 @@ fn interpolate(pilot_h: &[Complex32]) -> Vec<Complex32> {
 /// Channel equaliser using DRM-style scattered pilots.
 ///
 /// Instead of fixed pilot positions, each OFDM symbol has pilots at positions
-/// determined by `is_pilot_at(k, sym_idx)`. The pilot positions rotate every
+/// determined by `is_drm_pilot(k, sym_idx)`. The pilot positions rotate every
 /// `SCAT_TIME_INT = 3` symbols, covering ALL carriers in one pilot cycle.
 ///
 /// Channel estimation is 2D: frequency interpolation within each symbol +
@@ -431,11 +432,11 @@ impl ScatteredEqualizer {
         self.syms_processed += 1;
 
         // ── 3. CPE (Common Phase Error) removal from pilots ─────────────────
-        let pilot_positions = pilot_indices(sym_idx);
+        let pilot_positions = drm_pilot_indices(sym_idx);
         let cpe: f32 = {
             let sum: Complex32 = pilot_positions.iter()
                 .map(|&k| {
-                    let expected = pilot_value(k, sym_idx);
+                    let expected = drm_pilot_value(k, sym_idx);
                     let h_meas = y[k] / expected;
                     h_meas * self.h[k].conj()
                 })
@@ -464,7 +465,7 @@ impl ScatteredEqualizer {
 
         let mut pilot_err2 = 0.0_f32;
         for &k in &pilot_positions {
-            let expected = pilot_value(k, sym_idx);
+            let expected = drm_pilot_value(k, sym_idx);
             let h_meas = y[k] / expected;
 
             // EMA update at this carrier
@@ -491,7 +492,7 @@ impl ScatteredEqualizer {
             ppos.sort();
 
             for k in 0..NUM_CARRIERS {
-                if is_pilot_at(k, sym_idx) { continue; }
+                if is_drm_pilot(k, sym_idx) { continue; }
 
                 // Find the nearest pilot below and above
                 let below = ppos.iter().rev().find(|&&p| p < k).copied();
@@ -520,11 +521,11 @@ impl ScatteredEqualizer {
             .sum::<f32>() / n_pilots;
         let sigma2_channel = mean_pilot_err2 * mean_h2;
 
-        let mut data = Vec::with_capacity(num_data_at(sym_idx));
-        let mut noise_var = Vec::with_capacity(num_data_at(sym_idx));
+        let mut data = Vec::with_capacity(drm_num_data(sym_idx));
+        let mut noise_var = Vec::with_capacity(drm_num_data(sym_idx));
 
         for k in 0..NUM_CARRIERS {
-            if is_pilot_at(k, sym_idx) { continue; }
+            if is_drm_pilot(k, sym_idx) { continue; }
 
             let h_k = h_interp[k];
             let h_sq = h_k.norm_sqr();
@@ -582,7 +583,7 @@ mod tests {
         let mut eq = ScatteredEqualizer::flat(0.5);
 
         for sym_idx in 0..12 {
-            let n_data = num_data_at(sym_idx);
+            let n_data = drm_num_data(sym_idx);
             let data_sc = vec![target; n_data];
             let sym = ofdm_modulate_scattered(&data_sc, sym_idx);
 
@@ -614,7 +615,7 @@ mod tests {
         let mut last_snr = 0.0_f32;
 
         for sym_idx in 0..10 {
-            let n_data = num_data_at(sym_idx);
+            let n_data = drm_num_data(sym_idx);
             let data_sc = vec![Complex32::new(1.0, 0.0); n_data];
             let sym = ofdm_modulate_scattered(&data_sc, sym_idx);
             let sym_real: Vec<Complex32> = sym.iter()

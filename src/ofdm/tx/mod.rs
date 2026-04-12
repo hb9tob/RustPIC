@@ -58,15 +58,16 @@ pub fn ofdm_modulate_scattered(
     data_subcarriers: &[Complex32],
     sym_idx: usize,
 ) -> Vec<Complex32> {
-    debug_assert_eq!(data_subcarriers.len(), num_data_at(sym_idx));
+    use crate::ofdm::drm_pilots::{is_drm_pilot, drm_pilot_value, drm_num_data};
+    debug_assert_eq!(data_subcarriers.len(), drm_num_data(sym_idx));
 
     let mut freq = vec![Complex32::new(0.0, 0.0); FFT_SIZE];
     let mut data_idx = 0usize;
 
     for k in 0..NUM_CARRIERS {
         let bin = carrier_to_bin(k);
-        if is_pilot_at(k, sym_idx) {
-            freq[bin] = pilot_value(k, sym_idx);
+        if is_drm_pilot(k, sym_idx) {
+            freq[bin] = drm_pilot_value(k, sym_idx);
         } else {
             freq[bin] = data_subcarriers[data_idx];
             data_idx += 1;
