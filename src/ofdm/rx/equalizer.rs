@@ -450,13 +450,25 @@ impl ScatteredEqualizer {
         }
 
         // ── 4. Measure H at pilot positions, EMA update ─────────────────────
+        // Fast convergence on the first CONVERGENCE_SYMS symbols after init
+        // or resync: use alpha=0.8 instead of the configured (slow) alpha.
+        // This mirrors QSSTV's approach of repeating the first 20 blocks —
+        // we don't repeat, but we track aggressively so the channel estimate
+        // is usable within 3-4 symbols instead of 10+.
+        const CONVERGENCE_SYMS: usize = 6;
+        let ema_alpha = if self.syms_processed < CONVERGENCE_SYMS {
+            0.8_f32
+        } else {
+            self.alpha
+        };
+
         let mut pilot_err2 = 0.0_f32;
         for &k in &pilot_positions {
             let expected = pilot_value(k, sym_idx);
             let h_meas = y[k] / expected;
 
             // EMA update at this carrier
-            self.h[k] = self.h[k] * (1.0 - self.alpha) + h_meas * self.alpha;
+            self.h[k] = self.h[k] * (1.0 - ema_alpha) + h_meas * ema_alpha;
 
             // Pilot residual for SNR estimation
             let eq_pilot = y[k] * zf(self.h[k]);

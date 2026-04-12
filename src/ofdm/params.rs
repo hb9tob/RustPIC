@@ -146,7 +146,7 @@ pub const HEADER_REPEAT_SYMS: usize = 2 * SYMBOLS_PER_FRAME; // 30
 /// Pilot amplitude boost (sqrt(2) ≈ +3 dB above data, matching DRM spec).
 /// Boosted pilots improve channel estimation SNR at the cost of a small
 /// reduction in data power.
-pub const PILOT_BOOST: f32 = 1.414;
+pub const PILOT_BOOST: f32 = 1.0;
 
 // ── Subcarrier index helpers ──────────────────────────────────────────────────
 
