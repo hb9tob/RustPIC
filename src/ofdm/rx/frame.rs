@@ -61,7 +61,7 @@ use crate::fec::rs::{rs_interleave_m, RsCodec, RsLevel};
 use crate::ofdm::params::*;
 use crate::ofdm::rx::{
     demapper::demap,
-    equalizer::SymbolEqualizer,
+    equalizer::ScatteredEqualizer,
     mode_detect::{LdpcRate, ModeHeader, Modulation},
 };
 use crate::ofdm::scrambler::G3ruhScrambler;
@@ -228,7 +228,7 @@ pub struct FrameReceiver {
     packets_this_frame:  usize,
 
     // ── Processing units ──────────────────────────────────────────────────────
-    equalizer:    SymbolEqualizer,
+    equalizer:    ScatteredEqualizer,
     code:         LdpcCode,
     rs:           RsCodec,
     descrambler:  G3ruhScrambler,
@@ -279,7 +279,7 @@ impl FrameReceiver {
         let groups_this_frame  = packets_this_frame.div_ceil(m_interleave);
 
         let total_ldpc_blocks = groups_this_frame * blocks_per_group;
-        let bits_per_ofdm     = NUM_DATA * header.modulation.bits_per_symbol();
+        let bits_per_ofdm     = NUM_DATA_PER_SYM * header.modulation.bits_per_symbol();
         let total_coded_bits  = total_ldpc_blocks * LDPC_N;
         let total_data_syms   = total_coded_bits.div_ceil(bits_per_ofdm);
 
@@ -294,7 +294,7 @@ impl FrameReceiver {
             total_ldpc_blocks,
             total_data_syms,
             packets_this_frame,
-            equalizer:    SymbolEqualizer::from_preamble(channel_est, alpha),
+            equalizer:    ScatteredEqualizer::from_initial(channel_est, alpha),
             code,
             rs:           RsCodec::for_level(header.rs_level),
             descrambler:  G3ruhScrambler::new(),
@@ -360,13 +360,19 @@ impl FrameReceiver {
 
         // ── Re-sync ZC guard ─────────────────────────────────────────────────
         if self.header.has_resync && self.syms_in_group == RESYNC_PERIOD {
-            self.equalizer.resync_from_zc(ofdm_symbol);
+            // Re-seed the equalizer from the resync ZC's channel estimate.
+            let fft_window = &ofdm_symbol[CP_LEN..];
+            let h_new = crate::ofdm::rx::sync::channel_estimate_from_zc(fft_window);
+            self.equalizer.resync(&h_new);
             self.syms_in_group = 0;
             return PushResult::NeedMore;
         }
 
         // ── Regular data symbol ───────────────────────────────────────────────
-        let eq = self.equalizer.process(ofdm_symbol);
+        // sym_idx must match the TX's ofdm_modulate_scattered index:
+        // preamble_syms (=5) + data_sym_index
+        let sym_idx = (2 + MODE_HEADER_REPEAT) + self.data_syms_received;
+        let eq = self.equalizer.process(ofdm_symbol, sym_idx);
         self.pilot_snr_sum   += eq.pilot_snr_db;
         self.pilot_snr_count += 1;
 
@@ -553,7 +559,8 @@ impl FrameReceiver {
         }
 
         // Equalize the EOT symbol with BPSK demapper
-        let eq      = self.equalizer.process(ofdm_symbol);
+        let eot_sym_idx = (2 + MODE_HEADER_REPEAT) + self.data_syms_received;
+        let eq      = self.equalizer.process(ofdm_symbol, eot_sym_idx);
         let eot_llr = demap(&eq.data, &eq.noise_var, Modulation::Bpsk);
 
         // Hard-decision on the first 32 subcarriers → 32-bit CRC

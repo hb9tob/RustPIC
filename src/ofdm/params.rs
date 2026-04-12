@@ -184,11 +184,12 @@ pub fn is_freq_pilot(k: usize) -> bool {
     FREQ_PILOTS.iter().any(|&(pk, _)| pk == k)
 }
 
-/// Returns `true` if `k` carries a pilot (scattered OR frequency) at
-/// symbol `sym_idx`.
+/// Returns `true` if `k` carries a pilot at symbol `sym_idx`.
+/// Currently uses scattered pilots only (freq pilots reserved for future
+/// pilot-based sync when ZC is removed).
 #[inline(always)]
 pub fn is_pilot_at(k: usize, sym_idx: usize) -> bool {
-    is_scattered_pilot(k, sym_idx) || is_freq_pilot(k)
+    is_scattered_pilot(k, sym_idx)
 }
 
 /// Returns the list of pilot carrier indices for a given symbol index.

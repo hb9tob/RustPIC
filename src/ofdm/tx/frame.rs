@@ -30,7 +30,7 @@ use crate::ofdm::{
         mode_detect::{encode_mode_header, LdpcRate, ModeHeader, Modulation},
     },
     scrambler::G3ruhScrambler,
-    tx::{bits_to_symbol, ofdm_modulate, ofdm_modulate_all_carriers},
+    tx::{bits_to_symbol, ofdm_modulate, ofdm_modulate_all_carriers, ofdm_modulate_scattered},
     zc::build_preamble,
 };
 
@@ -178,25 +178,28 @@ fn build_frame_internal(
     }
 
     // ── 2. Scramble coded bits (PRBS-15) then pad ─────────────────────────────
-    // Scramble first so the padding zeros become pseudo-random, preventing
-    // long all-+1 BPSK runs that cause PAPR spikes.
-    let bits_per_ofdm   = NUM_DATA * bps;
+    // With scattered pilots, each data symbol has NUM_DATA_PER_SYM = 35
+    // data carriers (constant because we use scattered-only, no freq pilots).
+    let bits_per_ofdm   = NUM_DATA_PER_SYM * bps;
     let total_data_syms = all_coded_bits.len().div_ceil(bits_per_ofdm);
     let padded_len      = total_data_syms * bits_per_ofdm;
 
-    // Generate enough PRBS bits to cover the final padded length before
-    // resizing, so the scrambler state stays aligned with what RX will see.
     let mut prbs = G3ruhScrambler::new();
     all_coded_bits.resize(padded_len, 0);
     prbs.scramble_bits(&mut all_coded_bits);
 
+    // The sym_idx passed to ofdm_modulate_scattered starts after the
+    // preamble (ZC#1 + ZC#2 + MODE_HEADER_REPEAT headers = 5 symbols).
+    // Each data symbol's pilot pattern rotates with sym_idx.
+    let preamble_syms = 2 + MODE_HEADER_REPEAT; // ZC pair + 3 mode headers
     let data_ofdm_syms: Vec<Vec<Complex32>> = (0..total_data_syms)
         .map(|i| {
             let bits    = &all_coded_bits[i * bits_per_ofdm..(i + 1) * bits_per_ofdm];
-            let data_sc: Vec<Complex32> = (0..NUM_DATA)
-                .map(|sym| bits_to_symbol(&bits[sym * bps..], config.modulation))
+            let n_data  = NUM_DATA_PER_SYM;
+            let data_sc: Vec<Complex32> = (0..n_data)
+                .map(|s| bits_to_symbol(&bits[s * bps..], config.modulation))
                 .collect();
-            ofdm_modulate(&data_sc)
+            ofdm_modulate_scattered(&data_sc, preamble_syms + i)
         })
         .collect();
 
