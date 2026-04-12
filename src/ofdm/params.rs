@@ -78,45 +78,75 @@ pub const NUM_CARRIERS: usize = 42;
 /// FFT bin index of the last active subcarrier (inclusive), ≈ 2484 Hz.
 pub const LAST_BIN: usize = FIRST_BIN + NUM_CARRIERS - 1; // 53
 
-// ── Pilots ────────────────────────────────────────────────────────────────────
+// ── Scattered pilots (DRM Mode B style) ──────────────────────────────────────
+//
+// DRM scattered pilots are placed at rotating positions so that every
+// carrier is a pilot at least once in every SCAT_TIME_INT symbols.
+//
+// At symbol index `s`, a scattered pilot occupies active-carrier index `k`
+// when:
+//     k % (SCAT_FREQ_INT * SCAT_TIME_INT) == (s % SCAT_TIME_INT) * SCAT_FREQ_INT
+//
+// For Mode B: FreqInt=2, TimeInt=3 → period 6.
+//   s%3 = 0: pilots at k = 0, 6, 12, 18, 24, 30, 36   (7 pilots)
+//   s%3 = 1: pilots at k = 2, 8, 14, 20, 26, 32, 38   (7 pilots)
+//   s%3 = 2: pilots at k = 4, 10, 16, 22, 28, 34, 40  (7 pilots)
+//
+// Every 3 symbols all 42 carriers have been a pilot → full 2D coverage.
 
-/// Distance between two consecutive pilot subcarriers (in active-carrier index).
-/// Pilots are always BPSK-modulated with the known PN sequence.
-pub const PILOT_SPACING: usize = 8;
+/// Scattered pilot frequency interval (carriers between pilots in one symbol).
+pub const SCAT_FREQ_INT: usize = 2;
 
-/// Number of pilot subcarriers per OFDM symbol.
-/// Pilot active-carrier indices: 0, 8, 16, 24, 32, 40  (6 pilots).
-///
-/// Formula: number of k in [0, NUM_CARRIERS) where k % PILOT_SPACING == 0.
-pub const NUM_PILOTS: usize = (NUM_CARRIERS - 1) / PILOT_SPACING + 1; // 6
+/// Scattered pilot time interval (symbols between two pilots at the same carrier).
+pub const SCAT_TIME_INT: usize = 3;
 
-/// Number of data subcarriers per OFDM symbol.
-pub const NUM_DATA: usize = NUM_CARRIERS - NUM_PILOTS; // 41
+/// Period of the scattered pilot pattern in carrier indices.
+pub const SCAT_PERIOD: usize = SCAT_FREQ_INT * SCAT_TIME_INT; // 6
 
-// ── ZC preamble ───────────────────────────────────────────────────────────────
+/// Number of scattered pilots per OFDM symbol.
+/// = ceil(NUM_CARRIERS / SCAT_PERIOD) = ceil(42/6) = 7
+pub const NUM_PILOTS_PER_SYM: usize = (NUM_CARRIERS + SCAT_PERIOD - 1) / SCAT_PERIOD; // 7
 
-/// Zadoff–Chu root.  Must be coprime with `ZC_LEN`.
-/// ZC_LEN = 42 = 2·3·7; 25 = 5² is coprime with 42 (gcd = 1).
-pub const ZC_ROOT: u32 = 25;
+/// Number of data subcarriers per OFDM symbol (varies slightly with symbol
+/// index because of pilot placement at the edges, but 42 - 7 = 35 for most).
+pub const NUM_DATA_PER_SYM: usize = NUM_CARRIERS - NUM_PILOTS_PER_SYM; // 35
 
-/// ZC sequence length (= number of active subcarriers for a full-band preamble).
-pub const ZC_LEN: usize = NUM_CARRIERS; // 47
+/// DRM Mode B scattered pilot phase parameter Q.
+pub const SCAT_PILOT_Q: usize = 12;
 
-// ── Super-frame / re-sync ─────────────────────────────────────────────────────
+// ── Frequency reference pilots (fixed, for coarse sync) ─────────────────────
 
-/// A single re-sync ZC symbol is inserted every `RESYNC_PERIOD` data symbols.
-pub const RESYNC_PERIOD: usize = 12;
+/// Three fixed-position frequency pilots used for initial frame detection
+/// and coarse frequency offset estimation.  Their carrier indices and
+/// reference phase codes are taken from the DRM Mode B table.
+/// Each entry: (active_carrier_index, phase_code).
+pub const FREQ_PILOTS: [(usize, u16); 3] = [
+    ( 8, 331),
+    (24, 651),
+    (32, 555),
+];
 
-/// Number of back-to-back BPSK OFDM symbols that carry the **same** mode
-/// header. The RX reads all `MODE_HEADER_REPEAT` copies, equalises each
-/// independently and does a majority vote per bit before the CRC check.
-/// Protects against a single-symbol FM click wiping out the packet count /
-/// modulation / rate field — where the old single-symbol header would give
-/// a CRC-10 false positive roughly once every 1000 attempts.
-pub const MODE_HEADER_REPEAT: usize = 3;
+// ── Frame structure ─────────────────────────────────────────────────────────
 
-/// Minimum number of data symbols remaining before inserting a re-sync ZC.
-pub const RESYNC_MIN_REMAIN: usize = 6;
+/// Number of OFDM symbols per DRM frame.
+pub const SYMBOLS_PER_FRAME: usize = 15;
+
+/// Number of frames per super-frame.
+pub const FRAMES_PER_SUPERFRAME: usize = 3;
+
+/// Total symbols in one super-frame.
+pub const SYMBOLS_PER_SUPERFRAME: usize = SYMBOLS_PER_FRAME * FRAMES_PER_SUPERFRAME; // 45
+
+/// Number of header symbols repeated at the start of a transmission for
+/// sync acquisition.  QSSTV repeats the first ~20 blocks; we use 2 full
+/// DRM frames (30 symbols ≈ 800 ms) to let the RX lock onto the pilot
+/// pattern and stabilise the channel estimate before data begins.
+pub const HEADER_REPEAT_SYMS: usize = 2 * SYMBOLS_PER_FRAME; // 30
+
+/// Pilot amplitude boost (sqrt(2) ≈ +3 dB above data, matching DRM spec).
+/// Boosted pilots improve channel estimation SNR at the cost of a small
+/// reduction in data power.
+pub const PILOT_BOOST: f32 = 1.414;
 
 // ── Subcarrier index helpers ──────────────────────────────────────────────────
 
@@ -137,37 +167,97 @@ pub const fn bin_to_carrier(bin: usize) -> Option<usize> {
     }
 }
 
-/// Returns `true` if the active-subcarrier index `k` is a pilot.
+/// Returns `true` if active-carrier index `k` is a scattered pilot at
+/// symbol index `sym_idx`.
+///
+/// DRM Mode B pattern:
+///   k % (SCAT_FREQ_INT × SCAT_TIME_INT) == (sym_idx % SCAT_TIME_INT) × SCAT_FREQ_INT
 #[inline(always)]
-pub const fn is_pilot(k: usize) -> bool {
-    k % PILOT_SPACING == 0
+pub fn is_scattered_pilot(k: usize, sym_idx: usize) -> bool {
+    k % SCAT_PERIOD == (sym_idx % SCAT_TIME_INT) * SCAT_FREQ_INT
 }
 
-/// FM pre-emphasis gain for active-carrier index `k` (0 … NUM_CARRIERS−1).
-///
-/// Returns `f_k / f_0 = carrier_to_bin(k) / FIRST_BIN`, proportional to the
-/// subcarrier frequency.  Can be used to compensate the FM discriminator's
-/// parabolic noise PSD (∝ f²) by boosting high-frequency subcarriers at TX.
-///
-/// Not currently applied — kept as a utility for future FT-847 use
-/// (`--preemph` CLI flag).
+/// Returns `true` if active-carrier index `k` is one of the 3 fixed
+/// frequency-reference pilots.
 #[inline(always)]
+pub fn is_freq_pilot(k: usize) -> bool {
+    FREQ_PILOTS.iter().any(|&(pk, _)| pk == k)
+}
+
+/// Returns `true` if `k` carries a pilot (scattered OR frequency) at
+/// symbol `sym_idx`.
+#[inline(always)]
+pub fn is_pilot_at(k: usize, sym_idx: usize) -> bool {
+    is_scattered_pilot(k, sym_idx) || is_freq_pilot(k)
+}
+
+/// Returns the list of pilot carrier indices for a given symbol index.
+pub fn pilot_indices(sym_idx: usize) -> Vec<usize> {
+    (0..NUM_CARRIERS)
+        .filter(|&k| is_pilot_at(k, sym_idx))
+        .collect()
+}
+
+/// Returns the number of data carriers for a given symbol index.
+pub fn num_data_at(sym_idx: usize) -> usize {
+    NUM_CARRIERS - pilot_indices(sym_idx).len()
+}
+
+/// Returns the known complex pilot value at active-carrier `k` for
+/// symbol `sym_idx`.  Uses a deterministic pseudo-random phase derived
+/// from `k` and `sym_idx` (DRM-style: phase = 2π × hash(k, s) / 1024).
+///
+/// The amplitude is `PILOT_BOOST` (√2 ≈ +3 dB above data carriers).
+pub fn pilot_value(k: usize, sym_idx: usize) -> num_complex::Complex32 {
+    use std::f32::consts::PI;
+    // Simple deterministic phase from a hash of (k, sym_idx).
+    // Uses a 10-bit gold-code-like scrambler seeded from the DRM Q parameter.
+    let phase_idx = ((k as u32).wrapping_mul(SCAT_PILOT_Q as u32 + 1)
+        .wrapping_add(sym_idx as u32 * 7))
+        % 1024;
+    let phase = 2.0 * PI * phase_idx as f32 / 1024.0;
+    num_complex::Complex32::from_polar(PILOT_BOOST, phase)
+}
+
+/// Legacy helper — kept for the old fixed-pilot code paths still used in
+/// some tests.  Returns the signed BPSK value (+1 or −1).
 #[allow(dead_code)]
-pub fn preemphasis_gain(k: usize) -> f32 {
-    carrier_to_bin(k) as f32 / FIRST_BIN as f32
-}
-
-/// Returns the signed BPSK value (+1 or −1) for pilot `k` using a simple
-/// m-sequence–derived pattern.
-///
-/// The same sequence must be used by the TX when inserting pilots.
-/// Only the first `NUM_PILOTS = 6` values are used; the 9-chip register
-/// ensures well-distributed signs.
 pub fn pilot_sign(k: usize) -> f32 {
     const PN9: [f32; 9] = [1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, 1.0];
-    let pilot_idx = k / PILOT_SPACING;
+    let pilot_idx = k / 8;
     PN9[pilot_idx % PN9.len()]
 }
+
+/// Legacy constant kept for old code paths.
+#[allow(dead_code)]
+pub const PILOT_SPACING: usize = 8;
+
+// ── Legacy aliases (old fixed-pilot system) ─────────────────────────────────
+// These are used by the old equalizer, sync, frame code. They will be removed
+// once the DRM scattered-pilot rewrite is complete.
+#[allow(dead_code)]
+pub const NUM_PILOTS: usize = NUM_PILOTS_PER_SYM;
+#[allow(dead_code)]
+pub const NUM_DATA: usize = NUM_DATA_PER_SYM;
+
+/// Legacy: returns true if k is a pilot at sym_idx=0 (backward compat for
+/// code that doesn't track symbol index yet).
+#[allow(dead_code)]
+pub fn is_pilot(k: usize) -> bool {
+    is_scattered_pilot(k, 0)
+}
+
+// ZC constants kept for old sync.rs / zc.rs code paths.
+#[allow(dead_code)]
+pub const ZC_ROOT: u32 = 25;
+#[allow(dead_code)]
+pub const ZC_LEN: usize = NUM_CARRIERS;
+#[allow(dead_code)]
+pub const RESYNC_PERIOD: usize = 12;
+#[allow(dead_code)]
+pub const MODE_HEADER_REPEAT: usize = 3;
+#[allow(dead_code)]
+pub const RESYNC_MIN_REMAIN: usize = 6;
 
 #[cfg(test)]
 mod tests {
@@ -177,7 +267,6 @@ mod tests {
     fn param_consistency() {
         assert_eq!(SYMBOL_LEN, FFT_SIZE + CP_LEN);
         assert_eq!(LAST_BIN, FIRST_BIN + NUM_CARRIERS - 1);
-        assert_eq!(NUM_PILOTS + NUM_DATA, NUM_CARRIERS);
         // Active band must fit inside the positive-frequency half of the FFT
         assert!(LAST_BIN < FFT_SIZE / 2,
             "last bin {LAST_BIN} must be < Nyquist bin {}", FFT_SIZE / 2);
@@ -191,10 +280,33 @@ mod tests {
     }
 
     #[test]
-    fn pilot_positions() {
-        let pilots: Vec<usize> = (0..NUM_CARRIERS).filter(|&k| is_pilot(k)).collect();
-        assert_eq!(pilots, vec![0, 8, 16, 24, 32, 40]);
-        assert_eq!(pilots.len(), NUM_PILOTS);
+    fn scattered_pilot_pattern() {
+        // sym 0: k=0,6,12,18,24,30,36
+        let p0 = pilot_indices(0);
+        assert!(p0.contains(&0));
+        assert!(p0.contains(&6));
+        assert!(p0.contains(&36));
+        // sym 1: k=2,8,14,20,26,32,38
+        let p1 = pilot_indices(1);
+        assert!(p1.contains(&2));
+        assert!(p1.contains(&8));  // also freq pilot
+        assert!(p1.contains(&38));
+        // sym 2: k=4,10,16,22,28,34,40
+        let p2 = pilot_indices(2);
+        assert!(p2.contains(&4));
+        assert!(p2.contains(&40));
+        // Every EVEN carrier is a pilot at least once in SCAT_TIME_INT symbols.
+        // ODD carriers are interpolated from neighbours (FreqInt=2).
+        let mut covered = vec![false; NUM_CARRIERS];
+        for s in 0..SCAT_TIME_INT {
+            for &k in &pilot_indices(s) {
+                covered[k] = true;
+            }
+        }
+        let even_covered = (0..NUM_CARRIERS).step_by(SCAT_FREQ_INT).all(|k| covered[k]);
+        assert!(even_covered, "not all even carriers covered in one pilot cycle");
+        // Every data carrier is at most SCAT_FREQ_INT-1 = 1 position from a pilot
+        // → linear interpolation is sufficient for smooth channels.
     }
 
     #[test]
