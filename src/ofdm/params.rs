@@ -143,10 +143,22 @@ pub const SYMBOLS_PER_SUPERFRAME: usize = SYMBOLS_PER_FRAME * FRAMES_PER_SUPERFR
 /// pattern and stabilise the channel estimate before data begins.
 pub const HEADER_REPEAT_SYMS: usize = 2 * SYMBOLS_PER_FRAME; // 30
 
-/// Pilot amplitude boost (sqrt(2) ≈ +3 dB above data, matching DRM spec).
+/// Number of pilot-bearing dummy OFDM symbols before the mode header.
+/// Warms up the RX Hilbert filter and lets pilot sync detect the frame.
+pub const RUNIN_PREAMBLE_SYMS: usize = 10;
+
+/// Number of pilot-bearing dummy symbols after the EOT.
+/// Flushes the RX Hilbert filter and keeps the equaliser stable.
+pub const RUNOUT_SYMS: usize = 4;
+
+/// Total non-data symbols before the first data symbol.
+/// RUNIN preamble + mode header repeats.
+pub const PREAMBLE_SYMS: usize = RUNIN_PREAMBLE_SYMS + MODE_HEADER_REPEAT;
+
+/// Pilot amplitude boost (√2 ≈ +3 dB above data, matching DRM spec).
 /// Boosted pilots improve channel estimation SNR at the cost of a small
-/// reduction in data power.
-pub const PILOT_BOOST: f32 = 1.0;
+/// reduction in data power.  QSSTV uses the same √2 boost.
+pub const PILOT_BOOST: f32 = 1.414_213_6; // √2
 
 // ── Subcarrier index helpers ──────────────────────────────────────────────────
 

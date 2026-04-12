@@ -11,7 +11,7 @@ use num_complex::Complex32;
 use rustpic::{
     ofdm::{
         beacon::{try_decode_beacon, BEACON_ANN_SYMS},
-        params::{CP_LEN, MODE_HEADER_REPEAT, SAMPLE_RATE, SYMBOL_LEN},
+        params::{CP_LEN, MODE_HEADER_REPEAT, PREAMBLE_SYMS, RUNIN_PREAMBLE_SYMS, SAMPLE_RATE, SYMBOL_LEN},
         rx::{
             frame::{
                 FrameReceiver, PushResult, TransmissionReceiver, TxPushResult,
@@ -196,31 +196,19 @@ fn main() {
                 ps.symbol_pos, ps.sym_idx, ps.metric, ps.cfo_hz);
         }
 
-        // Navigate backward from the detected data symbol to the mode header.
-        // Data symbols start at sym_idx = MODE_HEADER_REPEAT (=3).
-        // The detected sym_idx might be > MODE_HEADER_REPEAT if the scanner
-        // found a later symbol.
-        let data_sym_offset = if ps.sym_idx >= MODE_HEADER_REPEAT {
-            ps.sym_idx - MODE_HEADER_REPEAT
-        } else {
-            // Detected a symbol before the data region — skip
-            search_start = ps.symbol_pos + SYMBOL_LEN;
-            continue;
-        };
-
-        let first_data_pos = match ps.symbol_pos.checked_sub(data_sym_offset * SYMBOL_LEN) {
+        // Navigate from the detected symbol to the frame start.
+        // The detected symbol has sym_idx in 0..SYMBOLS_PER_FRAME−1.
+        // RUNIN preamble = sym_idx 0..RUNIN_PREAMBLE_SYMS−1
+        // Mode header    = sym_idx RUNIN_PREAMBLE_SYMS..PREAMBLE_SYMS−1
+        // Data           = sym_idx PREAMBLE_SYMS+
+        let frame_start = match ps.symbol_pos.checked_sub(ps.sym_idx * SYMBOL_LEN) {
             Some(p) => p,
             None => { search_start = ps.symbol_pos + SYMBOL_LEN; continue; }
         };
-        let hdr_start = match first_data_pos.checked_sub(MODE_HEADER_REPEAT * SYMBOL_LEN) {
-            Some(p) => p,
-            None => { search_start = ps.symbol_pos + SYMBOL_LEN; continue; }
-        };
+        let hdr_start = frame_start + RUNIN_PREAMBLE_SYMS * SYMBOL_LEN;
+        let first_data_pos = frame_start + PREAMBLE_SYMS * SYMBOL_LEN;
 
         // ── CFO correction ─────────────────────────────────────────────────
-        // Apply frequency offset correction to the working buffer starting
-        // at the mode header.  The CFO from CP correlation phase is the
-        // fractional offset (within ±½ subcarrier spacing = ±23.4 Hz).
         if hdr_start + MODE_HEADER_REPEAT * SYMBOL_LEN > audio.len() {
             search_start = ps.symbol_pos + SYMBOL_LEN;
             continue;

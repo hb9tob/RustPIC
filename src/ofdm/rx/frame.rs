@@ -369,7 +369,7 @@ impl FrameReceiver {
         // We process them for channel tracking but discard their LLRs.
         if self.warmup_remaining > 0 {
             let warmup_idx = 10 - self.warmup_remaining; // 0, 1, 2, ...
-            let sym_idx = MODE_HEADER_REPEAT + warmup_idx;
+            let sym_idx = PREAMBLE_SYMS + warmup_idx;
             let _eq = self.equalizer.process(ofdm_symbol, sym_idx);
             self.warmup_remaining -= 1;
             return PushResult::NeedMore;
@@ -378,7 +378,7 @@ impl FrameReceiver {
         // ── Regular data symbol ───────────────────────────────────────────────
         // sym_idx = MODE_HEADER_REPEAT + data_syms_received, matching the TX's
         // ofdm_modulate_scattered(data, MODE_HEADER_REPEAT + i).
-        let sym_idx = MODE_HEADER_REPEAT + self.data_syms_received;
+        let sym_idx = PREAMBLE_SYMS + self.data_syms_received;
         let eq = self.equalizer.process(ofdm_symbol, sym_idx);
         // Only accumulate SNR metrics from pass2 (converged equaliser).
         let in_pass2 = self.data_syms_received >= self.data_syms_per_pass;
@@ -585,7 +585,7 @@ impl FrameReceiver {
         }
 
         // Equalize the EOT symbol with BPSK demapper
-        let eot_sym_idx = MODE_HEADER_REPEAT + self.data_syms_received;
+        let eot_sym_idx = PREAMBLE_SYMS + self.data_syms_received;
         let eq      = self.equalizer.process(ofdm_symbol, eot_sym_idx);
         let eot_llr = demap(&eq.data, &eq.noise_var, Modulation::Bpsk);
 
@@ -903,7 +903,7 @@ mod tests {
         // ── Build OFDM symbols (2 passes: RUNIN + DATA) ─────────────────────
         let bits_per_ofdm = NUM_DATA * bps; // 35
         let data_syms_per_pass = total_coded_bits.div_ceil(bits_per_ofdm);
-        let preamble_syms = MODE_HEADER_REPEAT;
+        let preamble_syms = PREAMBLE_SYMS;
 
         // Scramble exactly as TX does
         let mut all_coded_bits = vec![0u8; data_syms_per_pass * bits_per_ofdm];

@@ -193,9 +193,10 @@ fn build_frame_internal(
     // second chance on the DATA pass (soft-combine LLRs if both copies exist).
     // QSSTV does 24 RUNIN + 10 RUNOUT segments; we do a full 1× repeat.
     //
-    // sym_idx is CONTINUOUS across both passes so the scattered pilot pattern
-    // rotates correctly: pass1 uses sym_idx 3..3+D, pass2 uses 3+D..3+2D.
-    let preamble_syms = MODE_HEADER_REPEAT;
+    // sym_idx is CONTINUOUS across the whole frame so the scattered pilot
+    // pattern rotates correctly.
+    // Layout: RUNIN_PREAMBLE(10) + mode_header(3) + pass1(D) + pass2(D) + EOT + RUNOUT(4)
+    let preamble_syms = PREAMBLE_SYMS;
 
     // Build OFDM symbols for one complete pass (bits → constellation → IFFT).
     let build_pass = |sym_offset: usize| -> Vec<Vec<Complex32>> {
@@ -214,9 +215,18 @@ fn build_frame_internal(
     let pass2_syms = build_pass(total_data_syms);       // DATA
 
     // ── 3. Assemble sample stream ────────────────────────────────────────────
-    // No ZC preamble — sync is from scattered pilots (CP correlation + pilot
-    // phase matching).  Frame starts directly with the mode header.
     let mut samples: Vec<Complex32> = Vec::new();
+
+    // ── 3a. RUNIN preamble: pilot-bearing OFDM symbols before the mode
+    // header.  These warm up the RX Hilbert filter on real OFDM signal
+    // (not silence) and let the pilot sync detect the frame early.
+    // Like QSSTV's RUNIN segments, but using all-zero data carriers with
+    // proper scattered pilots so the RX equaliser can start tracking H.
+    for i in 0..RUNIN_PREAMBLE_SYMS {
+        let n_data = crate::ofdm::drm_pilots::drm_num_data(i);
+        let dummy_data = vec![Complex32::new(0.0, 0.0); n_data];
+        samples.extend_from_slice(&ofdm_modulate_scattered(&dummy_data, i));
+    }
 
     let header = ModeHeader {
         modulation:         config.modulation,
@@ -274,6 +284,16 @@ fn build_frame_internal(
         .collect();
     samples.extend_from_slice(&ofdm_modulate_scattered(&eot_sc, eot_sym_idx));
 
+    // ── RUNOUT: pilot-bearing dummy symbols after the EOT ─────────────────
+    // Ensures the RX Hilbert filter and equaliser have valid pilot data
+    // all the way through the last decoded symbol (like QSSTV's RUNOUT).
+    for i in 0..RUNOUT_SYMS {
+        let idx = eot_sym_idx + 1 + i;
+        let n_data = crate::ofdm::drm_pilots::drm_num_data(idx);
+        let dummy = vec![Complex32::new(0.0, 0.0); n_data];
+        samples.extend_from_slice(&ofdm_modulate_scattered(&dummy, idx));
+    }
+
     samples
 }
 
@@ -300,22 +320,21 @@ mod tests {
         let samples = build_frame(payload, config);
 
         // ── RX: pilot-based sync ──────────────────────────────────────────────
-        // scan_for_pilots finds the first data symbol with valid scattered
-        // pilots.  The mode header (all-carrier BPSK, no pilots) is right
-        // before the first data symbol, at MODE_HEADER_REPEAT symbols back.
-        // Skip mode header (MODE_HEADER_REPEAT symbols) — they don't have
-        // scattered pilots and can give false pilot matches (metric ~0.5).
-        let ps = scan_for_pilots(&samples, MODE_HEADER_REPEAT * SYMBOL_LEN, 0.3, 0.7)
-            .expect("pilot sync should find data symbols");
+        // scan_for_pilots finds the first pilot-bearing symbol.  The RUNIN
+        // preamble has sym_idx 0..RUNIN_PREAMBLE_SYMS-1.  We scan from the
+        // start — the first match will be a RUNIN preamble symbol, from which
+        // we can navigate to the mode header and data.
+        let ps = scan_for_pilots(&samples, 0, 0.3, 0.7)
+            .expect("pilot sync should find OFDM symbols");
 
-        // The mode header starts MODE_HEADER_REPEAT symbols before the
-        // first data symbol.  With preamble_syms = MODE_HEADER_REPEAT = 3,
-        // data starts at sym_idx 3 in the pilot pattern.  The detected
-        // sym_idx tells us which data symbol we found.
-        let data_sym_offset = ps.sym_idx.checked_sub(MODE_HEADER_REPEAT)
-            .expect("detected sym_idx should be >= MODE_HEADER_REPEAT");
-        let first_data_pos = ps.symbol_pos - data_sym_offset * SYMBOL_LEN;
-        let hdr_start = first_data_pos - MODE_HEADER_REPEAT * SYMBOL_LEN;
+        // Navigate from detected symbol to the mode header and data.
+        // sym_idx 0..9 = RUNIN preamble, 10..12 = mode header (no pilots),
+        // 13+ = data.
+        // From any detected sym_idx < PREAMBLE_SYMS (RUNIN preamble range),
+        // the mode header is at RUNIN_PREAMBLE_SYMS symbols from frame start.
+        let frame_start = ps.symbol_pos - ps.sym_idx * SYMBOL_LEN;
+        let hdr_start = frame_start + RUNIN_PREAMBLE_SYMS * SYMBOL_LEN;
+        let first_data_pos = frame_start + PREAMBLE_SYMS * SYMBOL_LEN;
 
         // Decode mode header (MODE_HEADER_REPEAT copies, soft-combined).
         let hdr_windows: Vec<&[Complex32]> = (0..MODE_HEADER_REPEAT)

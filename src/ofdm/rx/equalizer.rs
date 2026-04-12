@@ -515,11 +515,11 @@ impl ScatteredEqualizer {
             }
         }
 
-        // ── 6. ZF equalisation — data subcarriers only ──────────────────────
-        let mean_h2: f32 = pilot_positions.iter()
-            .map(|&k| self.h[k].norm_sqr())
-            .sum::<f32>() / n_pilots;
-        let sigma2_channel = mean_pilot_err2 * mean_h2;
+        // ── 6. MMSE equalisation — data subcarriers only ─────────────────
+        // MMSE: x̂ = conj(H)·y / (|H|² + σ²_n)
+        // Better than ZF at low SNR: avoids noise amplification in faded carriers.
+        // σ²_n estimated from pilot residuals (same as QSSTV's MIN_ABS_H floor).
+        let sigma2_noise = mean_pilot_err2.max(1e-6);
 
         let mut data = Vec::with_capacity(drm_num_data(sym_idx));
         let mut noise_var = Vec::with_capacity(drm_num_data(sym_idx));
@@ -529,8 +529,10 @@ impl ScatteredEqualizer {
 
             let h_k = h_interp[k];
             let h_sq = h_k.norm_sqr();
-            data.push(y[k] * zf(h_k));
-            noise_var.push(sigma2_channel / h_sq.max(1e-6));
+            // MMSE equalization
+            let w = h_k.conj() / (h_sq + sigma2_noise);
+            data.push(y[k] * w);
+            noise_var.push(sigma2_noise / (h_sq + sigma2_noise));
         }
 
         EqualizedSymbol { data, noise_var, pilot_snr_db }
