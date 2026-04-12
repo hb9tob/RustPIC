@@ -35,6 +35,9 @@ pub struct PilotSyncResult {
     pub channel_est: Vec<Complex32>,
     /// Pilot correlation metric (0..1, higher = better match).
     pub metric: f32,
+    /// Estimated carrier frequency offset in Hz (from CP correlation phase).
+    /// Positive = RX oscillator is above TX.
+    pub cfo_hz: f32,
 }
 
 /// Scans `samples` for OFDM symbols carrying valid DRM scattered pilots.
@@ -85,11 +88,16 @@ pub fn scan_for_pilots(
                 }
             }
 
+            // ── Stage 1b: CFO estimation from CP correlation phase ────
+            // arg(Σ r[d+n] · conj(r[d+n+N])) = 2π · Δf · N / fs
+            let cfo_hz = cp_correlation_cfo(samples, best_pos);
+
             // ── Stage 2: pilot detection at this symbol ─────────────────
             if best_pos + SYMBOL_LEN <= samples.len() {
-                if let Some(result) = try_pilot_match(
+                if let Some(mut result) = try_pilot_match(
                     samples, best_pos, &fft, scale, pilot_threshold,
                 ) {
+                    result.cfo_hz = cfo_hz;
                     return Some(result);
                 }
             }
@@ -172,6 +180,7 @@ fn try_pilot_match(
         sym_idx: best_sym_idx,
         channel_est,
         metric: best_metric,
+        cfo_hz: 0.0, // filled in by caller from cp_correlation_cfo
     })
 }
 
@@ -239,6 +248,34 @@ pub fn cp_correlation(samples: &[Complex32], d: usize) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Estimates the carrier frequency offset (CFO) from the CP correlation
+/// phase at position `d`.
+///
+/// The cyclic prefix is a copy of the FFT window tail delayed by `FFT_SIZE`
+/// samples.  A frequency offset Δf causes the CP copy to rotate by
+/// `2π · Δf · FFT_SIZE / fs` relative to the tail.  The arg of the CP
+/// correlation reveals this rotation.
+///
+/// Returns the CFO in Hz.  Range: ±(fs / 2·FFT_SIZE) = ±23.4 Hz.
+/// This covers the "fractional" CFO (within ±½ subcarrier spacing).
+pub fn cp_correlation_cfo(samples: &[Complex32], d: usize) -> f32 {
+    if d + SYMBOL_LEN > samples.len() {
+        return 0.0;
+    }
+
+    let mut corr = Complex32::new(0.0, 0.0);
+    for n in 0..CP_LEN {
+        let a = samples[d + n];
+        let b = samples[d + n + FFT_SIZE];
+        corr += a * b.conj();
+    }
+
+    // arg(corr) = 2π · Δf · FFT_SIZE / fs
+    // Δf = arg(corr) · fs / (2π · FFT_SIZE)
+    let phase = corr.arg();
+    phase * SAMPLE_RATE / (2.0 * std::f32::consts::PI * FFT_SIZE as f32)
 }
 
 /// Given a detected sym_idx and the transmission preamble structure,

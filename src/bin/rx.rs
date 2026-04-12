@@ -191,9 +191,9 @@ fn main() {
         };
 
         if std::env::var("SYNC_DEBUG").is_ok() {
-            eprintln!("  [pilot] FOUND at {:.3}s: sym_pos={} sym_idx={} metric={:.3}",
+            eprintln!("  [pilot] FOUND at {:.3}s: sym_pos={} sym_idx={} metric={:.3} cfo={:.1}Hz",
                 ps.symbol_pos as f64 / SAMPLE_RATE as f64,
-                ps.symbol_pos, ps.sym_idx, ps.metric);
+                ps.symbol_pos, ps.sym_idx, ps.metric, ps.cfo_hz);
         }
 
         // Navigate backward from the detected data symbol to the mode header.
@@ -217,15 +217,29 @@ fn main() {
             None => { search_start = ps.symbol_pos + SYMBOL_LEN; continue; }
         };
 
-        // Decode mode header — MODE_HEADER_REPEAT copies, soft-combined.
+        // ── CFO correction ─────────────────────────────────────────────────
+        // Apply frequency offset correction to the working buffer starting
+        // at the mode header.  The CFO from CP correlation phase is the
+        // fractional offset (within ±½ subcarrier spacing = ±23.4 Hz).
         if hdr_start + MODE_HEADER_REPEAT * SYMBOL_LEN > audio.len() {
             search_start = ps.symbol_pos + SYMBOL_LEN;
             continue;
         }
+        let frame_end = (first_data_pos + 300 * SYMBOL_LEN).min(audio.len());
+        let mut buf: Vec<Complex32> = audio[hdr_start..frame_end].to_vec();
+        if ps.cfo_hz.abs() > 0.1 {
+            let omega = -2.0 * std::f32::consts::PI * ps.cfo_hz / SAMPLE_RATE;
+            for (i, s) in buf.iter_mut().enumerate() {
+                let phase = omega * i as f32;
+                *s *= Complex32::from_polar(1.0, phase);
+            }
+        }
+
+        // Decode mode header — MODE_HEADER_REPEAT copies, soft-combined.
         let hdr_windows: Vec<&[Complex32]> = (0..MODE_HEADER_REPEAT)
             .map(|r| {
-                let off = hdr_start + r * SYMBOL_LEN;
-                &audio[off + CP_LEN..off + SYMBOL_LEN]
+                let off = r * SYMBOL_LEN;
+                &buf[off + CP_LEN..off + SYMBOL_LEN]
             })
             .collect();
         let header = match decode_mode_header_repeated(&hdr_windows, &ps.channel_est) {
@@ -264,11 +278,13 @@ fn main() {
         };
 
         // Symbol-by-symbol processing — simple sequential, no resync ZCs.
+        // Offsets are relative to buf (which starts at hdr_start).
+        let data_offset_in_buf = MODE_HEADER_REPEAT * SYMBOL_LEN;
         let mut frame_result = None;
         for i in 0..n_expected {
-            let sym_pos = first_data_pos + i * SYMBOL_LEN;
-            if sym_pos + SYMBOL_LEN > audio.len() { break; }
-            match rx.push_symbol(&audio[sym_pos..sym_pos + SYMBOL_LEN]) {
+            let sym_pos = data_offset_in_buf + i * SYMBOL_LEN;
+            if sym_pos + SYMBOL_LEN > buf.len() { break; }
+            match rx.push_symbol(&buf[sym_pos..sym_pos + SYMBOL_LEN]) {
                 PushResult::NeedMore             => {}
                 PushResult::FrameComplete(frame) => { frame_result = Some(frame); break; }
                 PushResult::Error(_)             => break,
