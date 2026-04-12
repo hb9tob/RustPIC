@@ -10,7 +10,7 @@ use num_complex::Complex32;
 
 use rustpic::{
     ofdm::{
-        params::{CP_LEN, MODE_HEADER_REPEAT, PREAMBLE_SYMS, RUNIN_PREAMBLE_SYMS, SAMPLE_RATE, SYMBOL_LEN},
+        params::{CP_LEN, MODE_HEADER_REPEAT, PREAMBLE_SYMS, RUNIN_PREAMBLE_SYMS, SAMPLE_RATE, SYMBOL_LEN, SYMBOLS_PER_FRAME},
         rx::{
             frame::{
                 FrameReceiver, PushResult, TransmissionReceiver, TxPushResult,
@@ -175,6 +175,9 @@ fn main() {
     let mut n_frames_seen: usize = 0;
 
     let mut next_progress = audio.len() / 10;
+    // For multi-frame: if we decoded a frame and know exactly where the
+    // next one starts, skip pilot sync and jump directly.
+    let mut known_frame_start: Option<usize> = None;
 
     while search_start + 3 * SYMBOL_LEN <= audio.len() {
         if search_start >= next_progress {
@@ -183,43 +186,47 @@ fn main() {
             next_progress = search_start + audio.len() / 10;
         }
 
-        // ── Pilot-based sync ─────────────────────────────────────────────────
-        let ps = match scan_for_pilots(&audio, search_start, 0.3, 0.85) {
-            Some(r) => r,
-            None => { break; } // no more OFDM symbols found
+        // ── Frame start: known from previous frame, or pilot sync ────────
+        let (frame_start, channel_est, cfo_hz) = if let Some(fs) = known_frame_start.take() {
+            // Multi-frame continuation: we know exactly where the next frame is.
+            // Get a fresh channel_est from the RUNIN preamble of this frame.
+            let flat_h = vec![Complex32::new(1.0, 0.0); rustpic::ofdm::params::NUM_CARRIERS];
+            (fs, flat_h, 0.0_f32)
+        } else {
+            // First frame or lost sync: use pilot detection.
+            let ps = match scan_for_pilots(&audio, search_start, 0.3, 0.85) {
+                Some(r) => r,
+                None => { break; }
+            };
+            if std::env::var("SYNC_DEBUG").is_ok() {
+                eprintln!("  [pilot] FOUND at {:.3}s: sym_pos={} sym_idx={} metric={:.3} cfo={:.1}Hz",
+                    ps.symbol_pos as f64 / SAMPLE_RATE as f64,
+                    ps.symbol_pos, ps.sym_idx, ps.metric, ps.cfo_hz);
+            }
+            if std::env::var("CH_DEBUG").is_ok() {
+                eprint!("  [ch] |H| dB:");
+                for h in ps.channel_est.iter() {
+                    eprint!(" {:+5.1}", 20.0 * (h.norm() + 1e-12).log10());
+                }
+                eprintln!();
+            }
+            let fs = ps.symbol_pos.saturating_sub(ps.sym_idx * SYMBOL_LEN);
+            (fs, ps.channel_est, ps.cfo_hz)
         };
 
-        if std::env::var("SYNC_DEBUG").is_ok() {
-            eprintln!("  [pilot] FOUND at {:.3}s: sym_pos={} sym_idx={} metric={:.3} cfo={:.1}Hz",
-                ps.symbol_pos as f64 / SAMPLE_RATE as f64,
-                ps.symbol_pos, ps.sym_idx, ps.metric, ps.cfo_hz);
-        }
-        if std::env::var("CH_DEBUG").is_ok() {
-            eprint!("  [ch] |H| dB:");
-            for h in ps.channel_est.iter() {
-                eprint!(" {:+5.1}", 20.0 * (h.norm() + 1e-12).log10());
-            }
-            eprintln!();
-        }
-
-        // Navigate from the detected symbol to the frame start.
-        // sym_idx is modulo SYMBOLS_PER_FRAME → ambiguous.  Try each
-        // candidate frame_start (stepping back by SYMBOLS_PER_FRAME)
-        // and pick the one where the mode header QPSK CRC passes.
-        let base_back = ps.sym_idx * SYMBOL_LEN;
-        let mut frame_start = ps.symbol_pos.saturating_sub(base_back);
-        let mut hdr_start = frame_start + RUNIN_PREAMBLE_SYMS * SYMBOL_LEN;
-        let mut first_data_pos = frame_start + PREAMBLE_SYMS * SYMBOL_LEN;
+        let frame_start = frame_start;
+        let hdr_start = frame_start + RUNIN_PREAMBLE_SYMS * SYMBOL_LEN;
+        let first_data_pos = frame_start + PREAMBLE_SYMS * SYMBOL_LEN;
 
         // ── CFO correction on the full frame (RUNIN + header + data) ─────
         if first_data_pos + SYMBOL_LEN > audio.len() {
-            search_start = ps.symbol_pos + SYMBOL_LEN;
+            search_start += SYMBOL_LEN;
             continue;
         }
-        let frame_end = (first_data_pos + 300 * SYMBOL_LEN).min(audio.len());
+        let frame_end = audio.len(); // take everything from frame_start to end of audio
         let mut buf: Vec<Complex32> = audio[frame_start..frame_end].to_vec();
-        if ps.cfo_hz.abs() > 0.1 {
-            let omega = -2.0 * std::f32::consts::PI * ps.cfo_hz / SAMPLE_RATE;
+        if cfo_hz.abs() > 0.1 {
+            let omega = -2.0 * std::f32::consts::PI * cfo_hz / SAMPLE_RATE;
             for (i, s) in buf.iter_mut().enumerate() {
                 let phase = omega * i as f32;
                 *s *= Complex32::from_polar(1.0, phase);
@@ -231,7 +238,7 @@ fn main() {
         // converges on the real channel response BEFORE we decode the mode
         // header or any data.  This is the key to surviving NBFM channels.
         use rustpic::ofdm::rx::equalizer::ScatteredEqualizer;
-        let mut eq = ScatteredEqualizer::from_initial(&ps.channel_est, 0.3);
+        let mut eq = ScatteredEqualizer::from_initial(&channel_est, 0.3);
 
         // Feed RUNIN preamble (10 symbols with pilots, dummy data)
         for i in 0..RUNIN_PREAMBLE_SYMS {
@@ -253,8 +260,13 @@ fn main() {
         let eq_refs: Vec<&[Complex32]> = eq_data_vecs.iter().map(|v| v.as_slice()).collect();
         let header = match decode_mode_header_from_eq(&eq_refs) {
             Ok(h) => h,
-            Err(_) => {
-                search_start = ps.symbol_pos + SYMBOL_LEN;
+            Err(e) => {
+                if std::env::var("SYNC_DEBUG").is_ok() {
+                    eprintln!("  [hdr] FAIL at frame_start={} hdr_off={}: {e}",
+                        frame_start, RUNIN_PREAMBLE_SYMS * SYMBOL_LEN);
+                }
+                known_frame_start = None;
+                search_start += SYMBOL_LEN;
                 continue;
             }
         };
@@ -271,6 +283,11 @@ fn main() {
             .collect();
         let mut rx = FrameReceiver::new(&header, &converged_h, 0.3);
         let n_expected   = rx.expected_symbol_count();
+        if std::env::var("SYNC_DEBUG").is_ok() {
+            eprintln!("  [rx] frame_start={} data_offset={} n_expected={} buf.len={} need={}",
+                frame_start, PREAMBLE_SYMS * SYMBOL_LEN, n_expected, buf.len(),
+                PREAMBLE_SYMS * SYMBOL_LEN + n_expected * SYMBOL_LEN);
+        }
         let pkts_this    = {
             let remaining = header.total_packet_count
                                 .saturating_sub(header.packet_offset) as usize;
@@ -296,7 +313,8 @@ fn main() {
             Some(f) => f,
             None => {
                 eprintln!("  [frame {}] incomplete — skipping", frame_stats.len());
-                search_start = ps.symbol_pos + SYMBOL_LEN;
+                known_frame_start = None;
+                search_start += SYMBOL_LEN;
                 continue;
             }
         };
@@ -347,7 +365,19 @@ fn main() {
             TxPushResult::NeedMoreFrames => {}
         }
 
-        search_start = first_data_pos + n_expected * SYMBOL_LEN;
+        // Advance past this frame: preamble + data + EOT + RUNOUT.
+        let frame_total = PREAMBLE_SYMS * SYMBOL_LEN
+            + n_expected * SYMBOL_LEN
+            + rustpic::ofdm::params::RUNOUT_SYMS * SYMBOL_LEN;
+        let next_pos = frame_start + frame_total;
+        search_start = next_pos;
+
+        // If we're assembling a multi-frame transmission and it's not
+        // complete yet, tell the next iteration exactly where the next
+        // frame starts (skip pilot sync).
+        if tx_rx.is_some() {
+            known_frame_start = Some(next_pos);
+        }
     }
 
     // ── End-of-audio summary ──────────────────────────────────────────────────
