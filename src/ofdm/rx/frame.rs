@@ -239,6 +239,8 @@ pub struct FrameReceiver {
     rs_payload: Vec<u8>,
 
     // ── Symbol / block counters ────────────────────────────────────────────────
+    warmup_remaining:    usize,
+    total_syms_fed:      usize, // warmup + data, for sym_idx pilot pattern
     data_syms_received:  usize,
     syms_in_group:       usize,
     ldpc_blocks_decoded: usize,
@@ -301,6 +303,8 @@ impl FrameReceiver {
             llr_buf:      Vec::new(),
             info_bits:    Vec::new(),
             rs_payload: Vec::new(),
+            warmup_remaining:    0,  // match TX WARMUP_SYMS
+            total_syms_fed:      0,
             data_syms_received:  0,
             syms_in_group:       0,
             ldpc_blocks_decoded: 0,
@@ -341,7 +345,7 @@ impl FrameReceiver {
         } else {
             0
         };
-        self.total_data_syms + resync_syms + 1 // +1 for EOT
+        self.total_data_syms + resync_syms + 1 // data + resync + EOT (warmup handled separately when > 0)
     }
 
     // ── Main entry point ──────────────────────────────────────────────────────
@@ -368,9 +372,23 @@ impl FrameReceiver {
             return PushResult::NeedMore;
         }
 
+        // ── Warm-up symbols: EQ training only, no LDPC ────────────────────────
+        // The TX prepends WARMUP_SYMS copies of the first data symbols so the
+        // scattered-pilot equaliser converges before real data begins.
+        // We process them for channel tracking but discard their LLRs.
+        if self.warmup_remaining > 0 {
+            // Warmup symbols are copies of the first data symbols — their
+            // sym_idx matches the data symbols they mirror.
+            let warmup_idx = 10 - self.warmup_remaining; // 0, 1, 2, ...
+            let sym_idx = (2 + MODE_HEADER_REPEAT) + warmup_idx;
+            let _eq = self.equalizer.process(ofdm_symbol, sym_idx);
+            self.warmup_remaining -= 1;
+            return PushResult::NeedMore;
+        }
+
         // ── Regular data symbol ───────────────────────────────────────────────
-        // sym_idx must match the TX's ofdm_modulate_scattered index:
-        // preamble_syms (=5) + data_sym_index
+        // sym_idx = preamble_syms + data_syms_received, matching the TX's
+        // ofdm_modulate_scattered(data, preamble_syms + i).
         let sym_idx = (2 + MODE_HEADER_REPEAT) + self.data_syms_received;
         let eq = self.equalizer.process(ofdm_symbol, sym_idx);
         self.pilot_snr_sum   += eq.pilot_snr_db;
@@ -392,6 +410,7 @@ impl FrameReceiver {
         let llrs = demap(&eq.data, &eq.noise_var, self.header.modulation);
         self.llr_buf.extend_from_slice(&llrs);
         self.data_syms_received += 1;
+        self.total_syms_fed     += 1;
         self.syms_in_group      += 1;
 
         self.drain_ldpc_blocks();

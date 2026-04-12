@@ -234,6 +234,20 @@ fn build_frame_internal(
         samples.extend_from_slice(&mode_hdr_sym);
     }
 
+    // ── 4b. Warm-up: repeat the first WARMUP_SYMS data symbols ──────────────
+    // These extra symbols at the start let the scattered-pilot equaliser
+    // converge before the "real" data begins. The RX skips the first
+    // WARMUP_SYMS for LDPC decoding but still processes them for channel
+    // estimation. The data they carry is identical to the first WARMUP_SYMS
+    // of the real data, so the LDPC can soft-combine if it wants.
+    //
+    // QSSTV goes much further (RUNIN=24 segments), but this is a start.
+    const WARMUP_SYMS: usize = 0; // TODO: restore to 10 once RX warm-up is debugged
+    let warmup_count = WARMUP_SYMS.min(data_ofdm_syms.len());
+    for i in 0..warmup_count {
+        samples.extend_from_slice(&data_ofdm_syms[i]);
+    }
+
     for (data_sym_idx, sym) in data_ofdm_syms.iter().enumerate() {
         if config.has_resync && data_sym_idx > 0 && data_sym_idx % RESYNC_PERIOD == 0 {
             samples.extend_from_slice(&resync_sym);
