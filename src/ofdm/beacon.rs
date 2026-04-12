@@ -102,10 +102,18 @@ pub fn build_beacon(callsign: &str, filename: &str, mode_str: &str) -> Vec<Compl
     // remaining bits stay 0 (pos should be exactly 360 here)
 
     // ── 1 kHz tone symbols ────────────────────────────────────────────────────
+    // The tone amplitude is matched to the RMS of an OFDM data symbol
+    // (~0.21 at 42 carriers) so the whole transmission has a uniform power
+    // envelope.  A full-scale tone (amplitude 1.0, RMS 0.71) would dominate
+    // the TX's global peak normalisation and push the data 6 dB below the
+    // clipping floor, wasting half the available dynamic range on the radio's
+    // audio input.  A sine at amplitude A has RMS = A/√2; setting A = 0.30
+    // gives RMS ≈ 0.21, matching the OFDM symbols.
+    const TONE_AMPLITUDE: f32 = 0.30;
     let tone_samples = BEACON_TONE_SYMS * SYMBOL_LEN;
     let mut out = Vec::with_capacity(BEACON_TOTAL_SYMS * SYMBOL_LEN);
     for i in 0..tone_samples {
-        let s = (2.0 * PI * TONE_HZ * i as f32 / SAMPLE_RATE).sin();
+        let s = TONE_AMPLITUDE * (2.0 * PI * TONE_HZ * i as f32 / SAMPLE_RATE).sin();
         out.push(Complex32::new(s, 0.0));
     }
 
