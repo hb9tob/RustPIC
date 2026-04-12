@@ -10,7 +10,6 @@ use num_complex::Complex32;
 
 use rustpic::{
     ofdm::{
-        beacon::{try_decode_beacon, BEACON_ANN_SYMS},
         params::{CP_LEN, MODE_HEADER_REPEAT, PREAMBLE_SYMS, RUNIN_PREAMBLE_SYMS, SAMPLE_RATE, SYMBOL_LEN},
         rx::{
             frame::{
@@ -18,7 +17,7 @@ use rustpic::{
                 max_packets_per_frame,
             },
             hilbert::HilbertFilter,
-            mode_detect::{decode_mode_header_repeated, LdpcRate, ModeHeader, Modulation},
+            mode_detect::{decode_mode_header_from_eq, LdpcRate, ModeHeader, Modulation},
             pilot_sync::scan_for_pilots,
         },
     },
@@ -195,6 +194,13 @@ fn main() {
                 ps.symbol_pos as f64 / SAMPLE_RATE as f64,
                 ps.symbol_pos, ps.sym_idx, ps.metric, ps.cfo_hz);
         }
+        if std::env::var("CH_DEBUG").is_ok() {
+            eprint!("  [ch] |H| dB:");
+            for h in ps.channel_est.iter() {
+                eprint!(" {:+5.1}", 20.0 * (h.norm() + 1e-12).log10());
+            }
+            eprintln!();
+        }
 
         // Navigate from the detected symbol to the frame start.
         // The detected symbol has sym_idx in 0..SYMBOLS_PER_FRAME−1.
@@ -223,40 +229,33 @@ fn main() {
             }
         }
 
-        // Decode mode header — MODE_HEADER_REPEAT copies, soft-combined.
-        let hdr_windows: Vec<&[Complex32]> = (0..MODE_HEADER_REPEAT)
-            .map(|r| {
-                let off = r * SYMBOL_LEN;
-                &buf[off + CP_LEN..off + SYMBOL_LEN]
-            })
-            .collect();
-        let header = match decode_mode_header_repeated(&hdr_windows, &ps.channel_est) {
+        // Decode mode header — QPSK with scattered pilots, through the equalizer.
+        use rustpic::ofdm::rx::equalizer::ScatteredEqualizer;
+        let mut hdr_eq = ScatteredEqualizer::from_initial(&ps.channel_est, 0.5);
+
+        let mut eq_data_vecs: Vec<Vec<Complex32>> = Vec::new();
+        for r in 0..MODE_HEADER_REPEAT {
+            let off = r * SYMBOL_LEN;
+            if off + SYMBOL_LEN > buf.len() { break; }
+            let sym_idx = RUNIN_PREAMBLE_SYMS + r;
+            let eq = hdr_eq.process(&buf[off..off + SYMBOL_LEN], sym_idx);
+            eq_data_vecs.push(eq.data);
+        }
+        let eq_refs: Vec<&[Complex32]> = eq_data_vecs.iter().map(|v| v.as_slice()).collect();
+        let header = match decode_mode_header_from_eq(&eq_refs) {
             Ok(h) => h,
             Err(_) => {
-                // Not a valid mode header — might be a beacon or noise.
-                // Try to decode as beacon.
-                let ann_end = hdr_start + BEACON_ANN_SYMS * SYMBOL_LEN;
-                if ann_end <= audio.len() {
-                    if let Some(info) = try_decode_beacon(
-                        &audio[hdr_start..ann_end], &ps.channel_est)
-                    {
-                        eprint!("\r{:50}\r", "");
-                        eprintln!("  Beacon    : {}", info.text);
-                    }
-                }
                 search_start = ps.symbol_pos + SYMBOL_LEN;
                 continue;
             }
         };
 
-        // Initialise TransmissionReceiver from the first decoded header.
         if tx_rx.is_none() {
             let (_, rs_k, _) = header.rs_level.params();
             tx_rx = Some(TransmissionReceiver::new(header.total_packet_count, rs_k));
         }
 
-        // Prepare frame receiver.
-        let mut rx       = FrameReceiver::new(&header, &ps.channel_est, 0.3);
+        let mut rx = FrameReceiver::new(&header, &ps.channel_est, 0.3);
         let n_expected   = rx.expected_symbol_count();
         let pkts_this    = {
             let remaining = header.total_packet_count

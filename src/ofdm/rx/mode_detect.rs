@@ -284,54 +284,74 @@ pub fn decode_mode_header(
     decode_mode_header_repeated(std::slice::from_ref(&fft_window), channel_est)
 }
 
-/// Decodes the mode header from **one or more** repeated BPSK OFDM symbols.
-///
-/// When MODE_HEADER_REPEAT > 1, the TX emits several identical copies of the
-/// mode-header symbol back-to-back. This routine equalises each copy against
-/// the same ZC-derived channel estimate, sums the equalised complex values
-/// per carrier (soft combining — gives ~√N SNR gain because the noise is
-/// approximately uncorrelated between symbols while the signal adds
-/// coherently), then hard-decides the BPSK bits and verifies the CRC-10.
-///
-/// A single-symbol input is identical to the legacy single-pass decode.
+/// Legacy BPSK mode header decoder (used by simtest and old code paths).
 pub fn decode_mode_header_repeated(
     fft_windows: &[&[Complex32]],
     channel_est: &[Complex32],
 ) -> Result<ModeHeader, ModeError> {
-    if fft_windows.is_empty() {
-        return Err(ModeError::BadFftWindowLen { got: 0 });
-    }
-    if channel_est.len() != NUM_CARRIERS {
-        return Err(ModeError::BadChannelEstLen { got: channel_est.len() });
-    }
-    for w in fft_windows {
-        if w.len() != FFT_SIZE {
-            return Err(ModeError::BadFftWindowLen { got: w.len() });
-        }
-    }
-
-    // Sum the equalised complex values across all repetitions.
+    if fft_windows.is_empty() { return Err(ModeError::BadFftWindowLen { got: 0 }); }
+    if channel_est.len() != NUM_CARRIERS { return Err(ModeError::BadChannelEstLen { got: channel_est.len() }); }
     let mut combined = vec![Complex32::new(0.0, 0.0); NUM_CARRIERS];
     for window in fft_windows {
-        let subcarriers = ofdm_demodulate(window);
-        for (i, (&y, &h)) in subcarriers.iter().zip(channel_est.iter()).enumerate() {
+        if window.len() != FFT_SIZE { return Err(ModeError::BadFftWindowLen { got: window.len() }); }
+        let sc = ofdm_demodulate(window);
+        for (i, (&y, &h)) in sc.iter().zip(channel_est.iter()).enumerate() {
             combined[i] += zf_equalise(y, h);
         }
     }
+    let bits: Vec<u8> = combined.iter().map(|c| u8::from(c.re >= 0.0)).collect();
+    decode_header_from_bits(&bits)
+}
 
-    // ── BPSK hard decisions → NUM_CARRIERS bits ───────────────────────────────
-    let bits: Vec<u8> = combined.iter()
-        .map(|c| u8::from(c.re >= 0.0))
-        .collect();
+/// Decodes the mode header from **one or more** repeated QPSK OFDM symbols
+/// with scattered pilots.
+///
+/// Each symbol is fed through the ScatteredEqualizer first. The equalized data
+/// carriers (QPSK, 2 bits each) are soft-combined across repetitions, then
+/// hard-decided to extract the 42-bit header.
+///
+/// `eq_data` is a slice of equalized data carrier vectors — one per repetition.
+/// Each inner Vec has `drm_num_data(sym_idx)` entries (typically 35).
+pub fn decode_mode_header_from_eq(
+    eq_data: &[&[Complex32]],
+) -> Result<ModeHeader, ModeError> {
+    if eq_data.is_empty() {
+        return Err(ModeError::BadFftWindowLen { got: 0 });
+    }
 
-    // ── Field extraction ──────────────────────────────────────────────────────
+    // Soft-combine across repetitions.
+    let n_data = eq_data[0].len();
+    let mut combined = vec![Complex32::new(0.0, 0.0); n_data];
+    for rep in eq_data {
+        for (i, &c) in rep.iter().enumerate() {
+            combined[i] += c;
+        }
+    }
+
+    // QPSK hard decisions → 2 bits per data carrier
+    let mut bits = Vec::with_capacity(n_data * 2);
+    for c in &combined {
+        bits.push(u8::from(c.re < 0.0)); // bit 0: re < 0 → 1
+        bits.push(u8::from(c.im < 0.0)); // bit 1: im < 0 → 1
+    }
+    if bits.len() < 42 {
+        return Err(ModeError::BadFftWindowLen { got: bits.len() });
+    }
+    decode_header_from_bits(&bits)
+}
+
+/// Common bit-level decoder for mode header — works for both BPSK and QPSK paths.
+fn decode_header_from_bits(bits: &[u8]) -> Result<ModeHeader, ModeError> {
+    if bits.len() < 42 {
+        return Err(ModeError::BadFftWindowLen { got: bits.len() });
+    }
     let modulation_code    = bits_to_u8(&bits[0..3]);
     let ldpc_rate_code     = bits_to_u8(&bits[3..5]);
     let rs_level_code      = bits_to_u8(&bits[5..7]);
     let has_resync         = bits[7] == 1;
-    let total_packet_count = bits_to_u16(&bits[8..20]);   // 12-bit field (max 4095)
-    let packet_offset      = bits_to_u16(&bits[20..32]);  // 12-bit field (max 4095)
-    let crc_received       = bits_to_u16(&bits[32..42]);  // 10-bit CRC (low 10 of CRC-16)
+    let total_packet_count = bits_to_u16(&bits[8..20]);
+    let packet_offset      = bits_to_u16(&bits[20..32]);
+    let crc_received       = bits_to_u16(&bits[32..42]);
 
     let modulation = Modulation::from_u8(modulation_code)
         .ok_or(ModeError::InvalidModulation(modulation_code))?;
@@ -340,16 +360,12 @@ pub fn decode_mode_header_repeated(
     let rs_level = RsLevel::from_u8(rs_level_code)
         .ok_or(ModeError::InvalidRsLevel(rs_level_code))?;
 
-    // ── CRC-10: lower 10 bits of CRC-16/CCITT over bits 0–31 ─────────────────
     let payload_bytes = bits_to_bytes(&bits[0..32]);
     let crc_computed  = crc16_ccitt(&payload_bytes) & 0x03FF;
     let crc_ok        = crc_computed == crc_received;
 
     if !crc_ok {
-        return Err(ModeError::CrcFailed {
-            computed: crc_computed,
-            received: crc_received,
-        });
+        return Err(ModeError::CrcFailed { computed: crc_computed, received: crc_received });
     }
 
     Ok(ModeHeader { modulation, ldpc_rate, rs_level, has_resync, total_packet_count, packet_offset, crc_ok })
@@ -399,24 +415,38 @@ fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
 ///
 /// This is the **TX** counterpart to [`decode_mode_header`], kept here so the
 /// bit layout is defined in a single place.
-pub fn encode_mode_header(hdr: &ModeHeader) -> Vec<f32> {
-    let mut bits = vec![0u8; NUM_CARRIERS]; // 47 bits
+/// Encodes the mode header as 42 raw bits (32 data + 10 CRC).
+///
+/// These bits are then mapped to QPSK constellation points by the TX frame
+/// builder (2 bits per symbol, with scattered pilots).
+pub fn encode_mode_header_bits(hdr: &ModeHeader) -> Vec<u8> {
+    let mut bits = vec![0u8; 42];
 
     // Field packing (MSB first)
     pack_bits_u8 (&mut bits[0..3],   hdr.modulation as u8,  3);
     pack_bits_u8 (&mut bits[3..5],   hdr.ldpc_rate  as u8,  2);
     pack_bits_u8 (&mut bits[5..7],   hdr.rs_level   as u8,  2);
     bits[7] = u8::from(hdr.has_resync);
-    pack_bits    (&mut bits[8..20],  hdr.total_packet_count, 12);  // 12-bit field
-    pack_bits    (&mut bits[20..32], hdr.packet_offset,      12);  // 12-bit field
+    pack_bits    (&mut bits[8..20],  hdr.total_packet_count, 12);
+    pack_bits    (&mut bits[20..32], hdr.packet_offset,      12);
 
-    // CRC-15: lower 15 bits of CRC-16/CCITT over first 4 bytes (bits 0–31)
+    // CRC-10: lower 10 bits of CRC-16/CCITT over bits 0–31
     let payload_bytes = bits_to_bytes(&bits[0..32]);
     let crc = crc16_ccitt(&payload_bytes) & 0x03FF;
     pack_bits(&mut bits[32..42], crc, 10);
 
-    // Map 0 → −1, 1 → +1
-    bits.iter().map(|&b| if b == 1 { 1.0f32 } else { -1.0f32 }).collect()
+    bits
+}
+
+/// Legacy BPSK encoder — kept for backward compatibility with old tests.
+pub fn encode_mode_header(hdr: &ModeHeader) -> Vec<f32> {
+    let bits = encode_mode_header_bits(hdr);
+    // Pad to NUM_CARRIERS and map to BPSK
+    let mut bpsk = vec![-1.0_f32; NUM_CARRIERS];
+    for (i, &b) in bits.iter().enumerate() {
+        bpsk[i] = if b == 1 { 1.0 } else { -1.0 };
+    }
+    bpsk
 }
 
 fn pack_bits(dst: &mut [u8], val: u16, nbits: usize) {

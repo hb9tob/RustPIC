@@ -237,16 +237,27 @@ fn build_frame_internal(
         packet_offset,
         crc_ok:             true,
     };
-    let hdr_bpsk = encode_mode_header(&header);
-    let hdr_sc: Vec<Complex32> = hdr_bpsk.iter()
-        .map(|&s| Complex32::new(s, 0.0))
-        .collect();
-    // Emit MODE_HEADER_REPEAT identical copies of the mode-header OFDM symbol
-    // back-to-back. The RX equalises each independently, majority-votes the
-    // bits, then verifies the CRC-10 on the voted result.
-    let mode_hdr_sym = ofdm_modulate_all_carriers(&hdr_sc);
-    for _ in 0..MODE_HEADER_REPEAT {
-        samples.extend_from_slice(&mode_hdr_sym);
+    let hdr_bits = crate::ofdm::rx::mode_detect::encode_mode_header_bits(&header);
+    // Emit MODE_HEADER_REPEAT copies of the mode-header as QPSK symbols with
+    // scattered pilots.  Each symbol carries 35 data carriers × 2 bits = 70 bits;
+    // the 42-bit header is placed in the first 21 QPSK symbols, rest is zero-padded.
+    for r in 0..MODE_HEADER_REPEAT {
+        let sym_idx = RUNIN_PREAMBLE_SYMS + r;
+        let n_data = crate::ofdm::drm_pilots::drm_num_data(sym_idx);
+        let data_sc: Vec<Complex32> = (0..n_data)
+            .map(|s| {
+                let bit_idx = s * 2;
+                let b0 = hdr_bits.get(bit_idx).copied().unwrap_or(0);
+                let b1 = hdr_bits.get(bit_idx + 1).copied().unwrap_or(0);
+                // QPSK: (2b-1)/√2 for each component
+                let scale = std::f32::consts::FRAC_1_SQRT_2;
+                Complex32::new(
+                    if b0 == 0 { scale } else { -scale },
+                    if b1 == 0 { scale } else { -scale },
+                )
+            })
+            .collect();
+        samples.extend_from_slice(&ofdm_modulate_scattered(&data_sc, sym_idx));
     }
 
     // ── 3b. RUNIN pass (first copy) ─────────────────────────────────────────
@@ -306,7 +317,8 @@ mod tests {
         fec::rs::RsLevel,
         ofdm::rx::{
             frame::{FrameReceiver, PushResult},
-            mode_detect::decode_mode_header_repeated,
+            equalizer::ScatteredEqualizer,
+            mode_detect::decode_mode_header_from_eq,
             pilot_sync::scan_for_pilots,
         },
     };
@@ -336,14 +348,18 @@ mod tests {
         let hdr_start = frame_start + RUNIN_PREAMBLE_SYMS * SYMBOL_LEN;
         let first_data_pos = frame_start + PREAMBLE_SYMS * SYMBOL_LEN;
 
-        // Decode mode header (MODE_HEADER_REPEAT copies, soft-combined).
-        let hdr_windows: Vec<&[Complex32]> = (0..MODE_HEADER_REPEAT)
-            .map(|r| {
-                let off = hdr_start + r * SYMBOL_LEN;
-                &samples[off + CP_LEN..off + SYMBOL_LEN]
-            })
-            .collect();
-        let header = decode_mode_header_repeated(&hdr_windows, &ps.channel_est)
+        // Decode mode header — QPSK with scattered pilots through equalizer.
+        let mut hdr_eq = ScatteredEqualizer::from_initial(&ps.channel_est, 0.5);
+        let mut eq_vecs: Vec<Vec<Complex32>> = Vec::new();
+        for r in 0..MODE_HEADER_REPEAT {
+            let off = hdr_start + r * SYMBOL_LEN;
+            if off + SYMBOL_LEN > samples.len() { break; }
+            let sym_idx = RUNIN_PREAMBLE_SYMS + r;
+            let eq = hdr_eq.process(&samples[off..off + SYMBOL_LEN], sym_idx);
+            eq_vecs.push(eq.data);
+        }
+        let eq_refs: Vec<&[Complex32]> = eq_vecs.iter().map(|v| v.as_slice()).collect();
+        let header = decode_mode_header_from_eq(&eq_refs)
             .unwrap_or_else(|e| panic!("header decode failed: {e}"));
 
         assert_eq!(header.modulation, config.modulation);

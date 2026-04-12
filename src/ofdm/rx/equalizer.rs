@@ -543,18 +543,25 @@ impl ScatteredEqualizer {
             }
         } else {
             // 2D interpolation from all stored pilot measurements.
+            // Weight = sinc(Δk·f_cut_k) × sinc(Δt·f_cut_t) × |H_pilot|²
+            // The |H|² term gives more weight to strong pilots and less to
+            // pilots in faded carriers (HPF corner, pre-emphasis rolloff).
+            // This is the same approach as QSSTV's Wiener filter: the noise
+            // regularization term 2·σ²/|a|² in the PHI diagonal effectively
+            // down-weights weak pilots.
             let n_buf = self.pilot_buf.len();
             for k in 0..NUM_CARRIERS {
                 let mut sum_w = 0.0_f32;
                 let mut sum_wh = Complex32::new(0.0, 0.0);
 
                 for (t_idx, pilots) in self.pilot_buf.iter().enumerate() {
-                    let dt = (n_buf - 1 - t_idx) as f32; // 0 = current, 1 = previous, ...
+                    let dt = (n_buf - 1 - t_idx) as f32;
                     for &(pk, ph) in pilots {
                         let dk = (k as f32 - pk as f32).abs();
                         let wk = sinc(dk * self.f_cut_k);
                         let wt = sinc(dt * self.f_cut_t);
-                        let w = wk * wt;
+                        let amp2 = ph.norm_sqr().max(1e-6);
+                        let w = wk * wt * amp2;
                         sum_w += w;
                         sum_wh += ph * w;
                     }
